@@ -1,0 +1,6 @@
+{
+  "domain": "cvxpy_optimizer",
+  "name": "CVXPY Optimizer",
+  "version": "0.1.0",
+  "requirements": ["cvxpy", "pandas"]
+}
