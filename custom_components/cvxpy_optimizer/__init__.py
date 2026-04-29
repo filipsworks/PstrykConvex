@@ -43,7 +43,7 @@ async def async_setup(hass, config):
             # 3. Optimization Parameters
             capacity_kwh = 8.32 
             max_charge_kw = 1.9  
-            max_discharge_kw = 1.9
+            max_discharge_kw = 3.6
             
             optimizer = BatteryOptimizer(
                 capacity_kwh=capacity_kwh,
