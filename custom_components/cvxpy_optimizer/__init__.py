@@ -1,82 +1,154 @@
+"""CVXPY Battery Optimizer – Home Assistant integration entry point.
+
+Registers the optimize_battery service and manages the optimizer lifecycle.
+Triggered hourly via automation to compute optimal battery charge/discharge modes.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
-import pandas as pd
-from .fetcher import HomeAssistantFetcher
-from .optimizer import BatteryOptimizer
-from .decider import Decider
+from typing import Any
+
+import numpy as np
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall
+
+from .const import DOMAIN, SERVICE_OPTIMIZE_BATTERY
+from .decider import ModeDecider, make_decision
+from .fetcher import BatteryState, Fetcher, PriceData
+from .optimizer import BatteryOptimizer, OptimizationResult
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup(hass, config):
-    """Set up the cvxpy_optimizer integration."""
-    _LOGGER.info("Setting up CVXPRY Optimizer integration")
-    
-    fetcher = HomeAssistantFetcher(hass)
-    decider = Decider()
 
-    # We will run the optimization periodically or via a service call.
-    # For now, let's just implement a basic setup that can be triggered.
-    
-    async def run_optimization(_):
-        try:
-            prices = fetcher.fetch_tomorrow_prices()
-            loads = fetcher.fetch_load_profile()
-            battery_status = fetcher.fetch_battery_status()
+# ── Platform Setup ────────────────────────────────────────────────────────
 
-            if prices.empty or loads.empty:
-                _LOGGER.error("Could not fetch enough data to run optimization.")
-                return
 
-            # 2. Estimate Battery SoC (Simplified)
-            current_soc_kwh = 5.0 
-            if not battery_status.empty and 'state' in battery_status.columns:
-                try:
-                    last_v = float(battery_status['state'].iloc[-1])
-                    # Linear approximation: 24V -> 0%, 28V -> 100%
-                    soc_pct = (last_v - 24) / (28 - 24)
-                    soc_pct = max(0, min(1, soc_pct))
-                    # Total capacity: 3.2kWh (using a smaller value for example)
-                    current_soc_kwh = soc_pct * 8.32
-                    _LOGGER.info(f"Estimated current SoC from voltage ({last_v}V): {soc_pct*100:.1f}% ({current_soc_kwh:.2f} kWh)")
-                except Exception as e:
-                    _LOGGER.warning(f"Could not estimate SoC from voltage, using default 5kWh: {e}")
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up the CVXPY optimizer from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
 
-            # 3. Optimization Parameters
-            capacity_kwh = 8.32 
-            max_charge_kw = 1.9  
-            max_discharge_kw = 3.6
-            
-            optimizer = BatteryOptimizer(
-                capacity_kwh=capacity_kwh,
-                max_charge_kw=max_charge_kw,
-                max_discharge_kw=max_discharge_kw
-            )
+    # Register the optimize_battery service
+    if not hass.services.has_service(DOMAIN, SERVICE_OPTIMIZE_BATTERY):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_OPTIMIZE_BATTERY,
+            handle_optimize_battery,
+        )
 
-            # Prepare loads for optimization (need to match prices index)
-            common_index = prices.index
-            load_series = pd.Series(loads['state'].values[:len(prices)], index=common_index)
-            price_int_series = prices['price'].set_axis(common_index)
+    # Set up sensor platform
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
 
-            # 4. Run Optimization
-            _LOGGER.info("Running optimization...")
-            results = optimizer.optimize(price_int_series, load_series, initial_soc_kwh=current_soc_kwh)
-            
-            # 5. Get decision for the NEXT step (index 0 of results)
-            next_step = results.iloc[0]
-            next_price = price_int_series.iloc[0]
-            
-            decision = decider.decide(
-                p_grid=next_step['p_grid'],
-                p_charge=next_step['p_charge'],
-                p_discharge=next_step['p_discharge'],
-                price=next_price
-            )
-
-            _LOGGER.info(f"Optimization Decision for Next Step: Output Mode={decision['output_mode']}, Charger Priority={decision['charger_priority']}")
-
-        except Exception as e:
-            _LOGGER.error(f"Optimization error: {e}")
-
-    # Register a service to trigger optimization manually
-    hass.services.async_register("cvxpy_optimizer", "run_optimization", run_optimization)
-
+    _LOGGER.info("CVXPY Battery Optimizer setup complete")
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor"])
+    if unload_ok:
+        hass.data.pop(DOMAIN, None)
+    return unload_ok
+
+
+# ── Service Handler ───────────────────────────────────────────────────────
+
+
+async def handle_optimize_battery(call: ServiceCall) -> dict[str, Any]:
+    """Handle the optimize_battery service call.
+
+    This is the main entry point triggered by Home Assistant automations.
+    Fetches current data, runs optimization, and returns recommended modes.
+
+    Service call example:
+      service: cvxpy_optimizer.optimize_battery
+      data:
+        initial_soc: 0.75  # Optional, defaults to sensor value
+    """
+    hass = call.hass
+    domain_data = hass.data.setdefault(DOMAIN, {})
+
+    _LOGGER.info("Running battery optimization...")
+
+    try:
+        fetcher = Fetcher(hass=hass)
+        optimizer = BatteryOptimizer()
+        decider = ModeDecider()
+
+        # Fetch data concurrently
+        price_task = asyncio.create_task(fetcher.fetch_horizon_prices())
+        battery_state_task = asyncio.create_task(fetcher.fetch_battery_state())
+        load_task = asyncio.create_task(fetcher.fetch_current_load())
+
+        prices, battery_state, current_load = await asyncio.gather(
+            price_task, battery_state_task, load_task
+        )
+
+        if prices is None:
+            _LOGGER.error("Cannot optimize without price data")
+            result = {"success": False, "error": "Price data unavailable"}
+            domain_data["latest_result"] = result
+            return result
+
+        # Get initial SoC from service call or sensor
+        initial_soc = call.data.get("initial_soc")
+        if initial_soc is None and battery_state.soc is not None:
+            initial_soc = battery_state.soc
+        elif initial_soc is None:
+            initial_soc = 0.5  # Default fallback
+
+        # Build load array (use current load as baseline for all steps)
+        n_steps = len(prices.prices)
+        if current_load is not None:
+            load_array = np.full(n_steps, current_load)
+        else:
+            load_array = np.zeros(n_steps)
+
+        # Run optimization
+        opt_result = optimizer.optimize(
+            prices=prices,
+            initial_soc=float(initial_soc),
+            load_power=load_array,
+        )
+
+        if not opt_result.solver_status.startswith("optimal"):
+            _LOGGER.warning("Optimization did not converge optimally: %s", opt_result.solver_status)
+
+        # Make mode decision
+        mode_decision = make_decision(
+            prices=prices,
+            battery_state=battery_state,
+            opt_result=opt_result,
+        )
+
+        # Build response dict
+        result = {
+            "success": True,
+            "discharge_mode": mode_decision.discharge_mode,
+            "charger_mode": mode_decision.charger_mode,
+            "reason": mode_decision.reason,
+            "schedule_summary": mode_decision.schedule_summary,
+            "solver_status": opt_result.solver_status,
+        }
+
+        # Store for sensor entities to read
+        domain_data["latest_result"] = result
+
+        _LOGGER.info(
+            "Optimization complete: discharge=%s, charger=%s, cost=%.2f PLN",
+            mode_decision.discharge_mode,
+            mode_decision.charger_mode,
+            opt_result.total_cost,
+        )
+
+        return result
+
+    except Exception:
+        _LOGGER.exception("Error during battery optimization")
+        error_result = {
+            "success": False,
+            "error": "Internal error during optimization",
+        }
+        domain_data["latest_result"] = error_result
+        return error_result

@@ -1,6 +1,13 @@
 {
   "domain": "cvxpy_optimizer",
-  "name": "CVXPY Optimizer",
-  "version": "0.1.0",
-  "requirements": ["cvxpy", "pandas"]
+  "name": "CVXPY Battery Optimizer",
+  "codeowners": [],
+  "dependencies": [],
+  "documentation": "https://github.com/username/cvxpy_optimizer",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/username/cvxpy_optimizer/issues",
+  "loggers": ["cvxpy_optimizer"],
+  "requirements": ["cvxpy>=1.5.0", "numpy>=1.24.0", "pandas>=2.0.0"],
+  "version": "1.0.0"
 }

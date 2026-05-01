@@ -1,0 +1,12 @@
+"""Service definitions for the CVXPY Battery Optimizer."""
+
+optimize_battery:
+  name: Optimize Battery
+  description: Run battery charge/discharge optimization and return recommended modes.
+  fields:
+    initial_soc:
+      name: Initial SoC
+      description: >
+        Override the battery's current State of Charge (0.0–1.0).
+        If not provided, uses sensor.gniazdo_battery_voltage to estimate.
+      example: 0.75
