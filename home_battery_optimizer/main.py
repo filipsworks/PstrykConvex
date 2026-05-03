@@ -116,9 +116,9 @@ Mode legend:
     )
     p.add_argument(
         "--output",
-        choices=["tui", "json"],
+        choices=["tui", "json", "sensitivity"],
         default="tui",
-        help="Output format (default: tui)",
+        help="Output format (default: tui). 'sensitivity' shows grid cost vs target SOC.",
     )
     p.add_argument(
         "--target-soc",
@@ -389,8 +389,113 @@ def main():
     # Output
     if args.output == "json":
         print(render_json(all_results))
+    elif args.output == "sensitivity":
+        print(render_sensitivity(prices, dummy_loads, initial_soc))
     else:
         print(render_tui(all_results))
+
+
+# ── Sensitivity analysis ───────────────────────────────────────────────────
+
+
+def run_sensitivity(
+    prices: list[dict], dummy_loads_kw: list[float], initial_soc: float
+) -> list[dict]:
+    """Run optimization for each target SOC level and collect results."""
+    results = []
+    soc_levels = range(0, 105, 5)  # 0%, 5%, ..., 100%
+
+    print(
+        f"Running sensitivity analysis ({len(soc_levels)} scenarios)...",
+        file=sys.stderr,
+    )
+
+    for target_pct in soc_levels:
+        target_soc = target_pct / 100.0
+        try:
+            result = optimize(
+                prices, dummy_loads_kw, initial_soc, target_soc=target_soc
+            )
+            summary = result["summary"]
+            total_active_kwh = sum(
+                prices[h]["price"]
+                * (
+                    dummy_loads_kw[h]
+                    + result["decisions"][h].get("charge_wh", 0) / 1000
+                )
+                for h in range(len(prices))
+            ) / max(sum(dummy_loads_kw), 0.001)  # normalize by average load
+
+            results.append(
+                {
+                    "target_soc": target_pct,
+                    "total_cost_pln": summary["total_cost_pln"],
+                    "grid_kwh": summary["total_grid_kwh"],
+                    "cost_per_kwh": summary["total_cost_pln"]
+                    / max(summary["total_grid_kwh"], 0.001),
+                }
+            )
+        except Exception as e:
+            print(f"  [warn] Target SOC {target_pct}% failed: {e}", file=sys.stderr)
+
+    return results
+
+
+def render_sensitivity(prices, dummy_loads_kw, initial_soc):
+    """Render sensitivity analysis as ASCII bar chart."""
+    results = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+
+    if not results:
+        print("No valid results from sensitivity analysis.", file=sys.stderr)
+        return ""
+
+    # Find best (cheapest cost per kWh)
+    best_idx = min(range(len(results)), key=lambda i: results[i]["cost_per_kwh"])
+    best_cost = results[best_idx]["cost_per_kwh"]
+
+    lines = []
+    sep = "─" * 70
+
+    lines.append(f"\n  📊 Sensitivity Analysis — Grid Cost vs Target SOC")
+    lines.append(sep)
+    lines.append(
+        f"  {'Target SOC':>12} │ {'Grid Cost (PLN)':>15} │ {'Cost/kWh':>10} │ Bar"
+    )
+    lines.append("  " + "─" * 12 + "┼" + "─" * 15 + "┼" + "─" * 10 + "┼" + "─" * 30)
+
+    max_bar_width = 30
+
+    for i, r in enumerate(results):
+        target_str = f"{r['target_soc']:2d}%"
+        cost_str = f"{r['total_cost_pln']:+.4f}"
+        cpkwh_str = f"{r['cost_per_kwh']:.4f}"
+
+        # Bar length proportional to cost (normalize to max)
+        max_cost = max(abs(r["cost_per_kwh"]) for r in results) or 1
+        bar_len = int(abs(r["cost_per_kwh"]) / max_cost * max_bar_width)
+        bar_len = max(0, min(bar_len, max_bar_width))
+
+        if i == best_idx:
+            color = "\033[92m"  # green for cheapest
+            marker = " ★"
+        else:
+            color = "\033[90m"  # gray for others
+            marker = ""
+
+        bar = "█" * bar_len + "." * (max_bar_width - bar_len)
+        reset = "\033[0m"
+
+        line = f"  {color}{target_str:>12}{reset} │ {cost_str:>15} │ {cpkwh_str:>10} │{color}{bar}{reset}{marker}"
+        lines.append(line)
+
+    lines.append(sep)
+    lines.append(f"\n  ★ = Cheapest option (lowest cost per kWh)")
+    lines.append(
+        f"  Best target SOC: {results[best_idx]['target_soc']}% @ {results[best_idx]['cost_per_kwh']:.4f} PLN/kWh"
+    )
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
