@@ -1,5 +1,7 @@
 """CVXPY optimization model for home battery scheduling."""
 
+import sys
+
 import cvxpy as cp
 import numpy as np
 from battery_model import (
@@ -13,7 +15,10 @@ from battery_model import (
 
 
 def optimize(
-    prices: list[dict], dummy_loads_kw: list[float], initial_soc: float
+    prices: list[dict],
+    dummy_loads_kw: list[float],
+    initial_soc: float,
+    target_soc: float = None,
 ) -> dict:
     """Run the CVXPY optimization and return results.
 
@@ -25,6 +30,7 @@ def optimize(
         prices: 24 hourly price dicts with 'hour', 'price' keys.
         dummy_loads_kw: 24-hour dummy load profile in kW.
         initial_soc: SOC at hour 0 (0–1).
+        target_soc: Optional target end-of-day SOC (0–1). If None, no constraint.
 
     Returns:
         dict with keys:
@@ -79,6 +85,14 @@ def optimize(
         # SOC bounds
         constraints.append(soc[h + 1] >= MIN_SOC)
         constraints.append(soc[h + 1] <= MAX_SOC)
+
+    # Target end-of-day SOC constraint (if specified)
+    if target_soc is not None:
+        constraints.append(soc[HOURS] >= target_soc)
+        print(
+            f"  → EOD target SOC ≥ {target_soc * 100:.0f}%",
+            file=sys.stderr,
+        )
 
     problem = cp.Problem(objective, constraints)
     # HIGHS is a robust LP/MIP solver — much better than OSQP for this problem

@@ -120,6 +120,13 @@ Mode legend:
         default="tui",
         help="Output format (default: tui)",
     )
+    p.add_argument(
+        "--target-soc",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Target end-of-day SOC in percent (0–100). Default: no constraint.",
+    )
     return p.parse_args()
 
 
@@ -364,8 +371,11 @@ def main():
             else initial_soc
         )
 
+        # Convert target SOC from percent to fraction (0–1)
+        target_soc = args.target_soc / 100 if args.target_soc is not None else None
+
         try:
-            result = optimize(day_prices, day_loads, soc_start)
+            result = optimize(day_prices, day_loads, soc_start, target_soc=target_soc)
         except Exception as e:
             print(f"[error] Optimization failed for day {i + 1}: {e}", file=sys.stderr)
             sys.exit(1)
