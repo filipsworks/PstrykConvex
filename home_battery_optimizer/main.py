@@ -94,10 +94,14 @@ Mode legend:
     p.add_argument("--mock", action="store_true", help="Use sample data instead of API")
     p.add_argument(
         "--ha-url",
-        default="",
-        help="Home Assistant base URL (e.g. https://ha.example.com)",
+        default="https://ha-finland.kompfix.pl",
+        help="Home Assistant base URL (e.g. https://ha-finland.kompfix.pl). /api is appended automatically.",
     )
-    p.add_argument("--ha-token", default="", help="Long-lived access token")
+    p.add_argument(
+        "--ha-token",
+        default="",
+        help="Long-lived access token (required unless --mock)",
+    )
     p.add_argument(
         "--horizon",
         choices=["today", "tomorrow", "available"],
@@ -122,23 +126,34 @@ Mode legend:
 # ── Data fetching ──────────────────────────────────────────────────────────
 
 
+def _build_base_url(ha_url: str) -> str:
+    """Ensure base URL ends with /api."""
+    url = ha_url.rstrip("/")
+    if not url.endswith("/api"):
+        url += "/api"
+    return url
+
+
 def get_data(args):
     """Return (prices, dummy_loads, initial_soc) for the requested horizon."""
-    if args.mock or (not args.ha_url and not args.ha_token):
+    if args.mock:
         print("[mock] Using sample data", file=sys.stderr)
         prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
         dummy_loads = MOCK_DUMMY_LOADS
         initial_soc = 0.35
     else:
-        # Override API client with CLI args
-        import api as api_mod
+        base_url = _build_base_url(args.ha_url)
 
-        api_mod.HA_BASE_URL = args.ha_url.rstrip("/")
-        api_mod.HA_TOKEN = args.ha_token
-
-        print(f"Fetching data from {args.ha_url} ...", file=sys.stderr)
+        print(f"Fetching data from {base_url} ...", file=sys.stderr)
         try:
-            data = api_mod.fetch_all_data(days=args.days, horizon=args.horizon)
+            import api as api_mod
+
+            data = api_mod.fetch_all_data(
+                base_url=base_url,
+                token=args.ha_token,
+                days=args.days,
+                horizon=args.horizon,
+            )
         except Exception as e:
             print(f"[error] API failed ({e}), falling back to mock", file=sys.stderr)
             prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
@@ -304,6 +319,14 @@ def render_json(all_results: list[dict]) -> str:
 
 def main():
     args = parse_args()
+
+    # Validate: either --mock or both --ha-url and --ha-token required
+    if not args.mock and not args.ha_token:
+        print(
+            "[error] Either --mock or --ha-token is required. Use --help for usage.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Fetch data
     prices, dummy_loads, initial_soc = get_data(args)

@@ -5,18 +5,19 @@ from typing import Optional
 
 import requests
 
-HA_BASE_URL = "https://ha-finland.kompfix.pl/api"
-HA_TOKEN = ""
+
+def _get_headers(base_url: str, token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
 
-def _headers() -> dict:
-    return {"Authorization": f"Bearer {HA_TOKEN}"}
-
-
-def fetch_hourly_prices(horizon: str = "available") -> list[dict]:
+def fetch_hourly_prices(
+    base_url: str, token: str, horizon: str = "available"
+) -> list[dict]:
     """Fetch hourly prices for the requested horizon.
 
     Args:
+        base_url: HA API base URL (e.g. https://ha-finland.kompfix.pl/api).
+        token: Long-lived access token.
         horizon: 'today', 'tomorrow', or 'available'.
                  'available' tries today first, falls back to tomorrow.
 
@@ -24,8 +25,8 @@ def fetch_hourly_prices(horizon: str = "available") -> list[dict]:
         List of 24 dicts with keys: hour, price (PLN/kWh), is_cheap, is_expensive.
     """
     # Try the "today" sensor first
-    url = f"{HA_BASE_URL}/states/sensor.pstryk_aio_obecna_cena_zakupu_pradu"
-    resp = requests.get(url, headers=_headers(), timeout=15)
+    url = f"{base_url}/states/sensor.pstryk_aio_obecna_cena_zakupu_pradu"
+    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -37,16 +38,20 @@ def fetch_hourly_prices(horizon: str = "available") -> list[dict]:
         raw_prices = prices_attr.get("tomorrow_prices", [])
         # If today's sensor doesn't have tomorrow_prices, try the dedicated sensor
         if not raw_prices:
-            url2 = f"{HA_BASE_URL}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
-            resp2 = requests.get(url2, headers=_headers(), timeout=15)
+            url2 = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
+            resp2 = requests.get(
+                url2, headers=_get_headers(base_url, token), timeout=15
+            )
             resp2.raise_for_status()
             data2 = resp2.json()
             raw_prices = data2.get("attributes", {}).get("tomorrow_prices", [])
     else:  # "available"
         raw_prices = prices_attr.get("today_prices", [])
         if not raw_prices:
-            url2 = f"{HA_BASE_URL}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
-            resp2 = requests.get(url2, headers=_headers(), timeout=15)
+            url2 = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
+            resp2 = requests.get(
+                url2, headers=_get_headers(base_url, token), timeout=15
+            )
             resp2.raise_for_status()
             data2 = resp2.json()
             raw_prices = data2.get("attributes", {}).get("tomorrow_prices", [])
@@ -83,10 +88,10 @@ def fetch_hourly_prices(horizon: str = "available") -> list[dict]:
     return full
 
 
-def fetch_battery_voltage() -> Optional[float]:
+def fetch_battery_voltage(base_url: str, token: str) -> Optional[float]:
     """Fetch current battery voltage."""
-    url = f"{HA_BASE_URL}/states/sensor.gniazdo_battery_voltage"
-    resp = requests.get(url, headers=_headers(), timeout=15)
+    url = f"{base_url}/states/sensor.gniazdo_battery_voltage"
+    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
     if resp.status_code != 200:
         return None
     data = resp.json()
@@ -99,7 +104,7 @@ def fetch_battery_voltage() -> Optional[float]:
         return None
 
 
-def fetch_battery_history(days: int = 1) -> dict:
+def fetch_battery_history(base_url: str, token: str, days: int = 1) -> dict:
     """Fetch battery voltage and current history for the last N days.
 
     Returns dict with 'voltage' (latest), 'charging', 'discharging' lists of dicts.
@@ -110,13 +115,13 @@ def fetch_battery_history(days: int = 1) -> dict:
     )
 
     url = (
-        f"{HA_BASE_URL}/history/period/{start_dt}?"
+        f"{base_url}/history/period/{start_dt}?"
         f"end_time={end_dt}&"
         f"filter_entity_id=sensor.gniazdo_battery_voltage,"
         f"sensor.gniazdo_battery_charging_current,"
         f"sensor.gniazdo_battery_discharge_current&minimal_response=true"
     )
-    resp = requests.get(url, headers=_headers(), timeout=30)
+    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
     if resp.status_code != 200:
         return {"voltage": None, "charging": [], "discharging": []}
 
@@ -150,13 +155,15 @@ def fetch_battery_history(days: int = 1) -> dict:
     return result
 
 
-def fetch_dummy_loads(days: int = 1) -> list[float]:
+def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
     """Fetch recent dummy load readings (kW) from inverter output power.
 
     Returns a list of 24 estimated kW values based on median of recent readings,
     with time-of-day pattern variation.
 
     Args:
+        base_url: HA API base URL.
+        token: Long-lived access token.
         days: How many days of history to sample.
     """
     end_dt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -165,11 +172,11 @@ def fetch_dummy_loads(days: int = 1) -> list[float]:
     )
 
     url = (
-        f"{HA_BASE_URL}/history/period/{start_dt}?"
+        f"{base_url}/history/period/{start_dt}?"
         f"end_time={end_dt}&"
         f"filter_entity_id=sensor.gniazdo_output_active_power&minimal_response=true"
     )
-    resp = requests.get(url, headers=_headers(), timeout=30)
+    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
     if resp.status_code != 200:
         return [1.5] * 24  # fallback
 
@@ -207,17 +214,21 @@ def fetch_dummy_loads(days: int = 1) -> list[float]:
     return loads
 
 
-def fetch_all_data(days: int = 1, horizon: str = "available") -> dict:
+def fetch_all_data(
+    base_url: str, token: str, days: int = 1, horizon: str = "available"
+) -> dict:
     """Fetch all required data in one call.
 
     Args:
+        base_url: HA API base URL (e.g. https://ha-finland.kompfix.pl/api).
+        token: Long-lived access token.
         days: Number of days for history sampling.
         horizon: Which day's prices to use ('today', 'tomorrow', 'available').
     """
-    prices = fetch_hourly_prices(horizon=horizon)
-    voltage = fetch_battery_voltage()
-    battery_hist = fetch_battery_history(days=days)
-    dummy_loads = fetch_dummy_loads(days=days)
+    prices = fetch_hourly_prices(base_url, token, horizon=horizon)
+    voltage = fetch_battery_voltage(base_url, token)
+    battery_hist = fetch_battery_history(base_url, token, days=days)
+    dummy_loads = fetch_dummy_loads(base_url, token, days=days)
 
     return {
         "prices": prices,
