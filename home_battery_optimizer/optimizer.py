@@ -123,16 +123,13 @@ def optimize(
         total_cost_pln += price_array[h] * (gl_val + ch_val)
 
         # Determine mode pair from solution values:
-        # Charging if charge > small threshold
         is_charging = ch_val > 0.01
-        # Discharging if discharge > small threshold AND grid isn't covering everything
         is_discharging = dis_val > 0.01 and gl_val < dummy_loads_kw[h] * 0.99
 
         if is_charging:
             output_mode = "SUB"
             charger_mode = "SNU"
         elif is_discharging:
-            # Check special case E: grid also supplying (gl > dummy baseline)
             if gl_val > dummy_loads_kw[h] * 0.99:
                 output_mode = "SUB"
                 charger_mode = "OSO"
@@ -140,11 +137,16 @@ def optimize(
                 output_mode = "SBU"
                 charger_mode = "OSO"
         else:
-            # Neither — default idle mode
             output_mode = "SUB"
             charger_mode = "OSO"
 
-        grid_cost = price_array[h] * (gl_val + ch_val)  # PLN/kWh × kW × 1h = PLN
+        # Total active power cost: price × (dummy loads + charge from grid)
+        # This shows what the hour costs regardless of battery mode,
+        # so you can compare SUB vs SBU decisions at a glance.
+        total_active_kw = dummy_loads_kw[h] + ch_val
+        total_cost_pln_hour = price_array[h] * total_active_kw
+
+        grid_cost = price_array[h] * (gl_val + ch_val)  # actual grid spend
 
         decisions.append(
             {
@@ -155,6 +157,8 @@ def optimize(
                 "discharge_wh": discharge_wh,
                 "soc_pct": round(soc_val * 100, 1),
                 "grid_cost_pln": round(grid_cost, 4),
+                "total_active_kw": round(total_active_kw, 3),
+                "total_cost_pln": round(total_cost_pln_hour, 4),
                 "price_plkwh": price_array[h],
             }
         )

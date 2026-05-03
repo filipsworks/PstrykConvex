@@ -199,11 +199,13 @@ def render_tui(all_results: list[dict]) -> str:
         price_w = 7
         charge_w = 10  # e.g. "+1.82 kWh" or "-1.44 kWh"
         soc_w = 7  # " 35.0%"
-        cost_w = 9  # "   0.6504"
+        grid_cost_w = 9  # actual grid spend: "    0.6504"
+        total_cost_w = 9  # total active power cost: "    1.2840"
 
         header_fmt = (
             f"  {{hr:>3}} │ {{mode:<{mode_w}}} │ {{price:>{price_w}s}} │ "
-            f"{{charge:>{charge_w}s}} │ {{soc:>{soc_w}s}} │ {{cost:>{cost_w}s}}"
+            f"{{charge:>{charge_w}s}} │ {{soc:>{soc_w}s}} │ "
+            f"{{grid_cost:>{grid_cost_w}s}} │ {{total_cost:>{total_cost_w}s}}"
         )
         sep_fmt = (
             "  "
@@ -217,7 +219,9 @@ def render_tui(all_results: list[dict]) -> str:
             + "┼"
             + "─" * soc_w
             + "┼"
-            + "─" * cost_w
+            + "─" * grid_cost_w
+            + "┼"
+            + "─" * total_cost_w
         )
 
         lines.append(
@@ -227,7 +231,8 @@ def render_tui(all_results: list[dict]) -> str:
                 price="Price",
                 charge="Charge",
                 soc="SOC%",
-                cost="Cost",
+                grid_cost="Grid Cost",
+                total_cost="Total Cost",
             )
         )
         lines.append(sep_fmt)
@@ -265,14 +270,16 @@ def render_tui(all_results: list[dict]) -> str:
 
             reset = "\033[0m"
             soc_str = f"{d['soc_pct']:5.1f}%"
-            cost_str = f"{d['grid_cost_pln']:.4f}"
+            grid_cost_str = f"{d['grid_cost_pln']:.4f}"
+            total_cost_str = f"{d['total_cost_pln']:.4f}"
 
             line = (
                 f"  {hour:3d}│{color}{mode_str:<{mode_w}}{reset}│"
                 f" {price_str:>6} │"
                 f"{color}{bar_str}{reset} {charge_str:>10s} │"
                 f" {soc_str:>5s} │"
-                f" {cost_str:>{cost_w}}"
+                f" {grid_cost_str:>{grid_cost_w}} │"
+                f" {total_cost_str:>{total_cost_w}}"
             )
             lines.append(line)
 
