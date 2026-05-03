@@ -116,9 +116,9 @@ Mode legend:
     )
     p.add_argument(
         "--output",
-        choices=["tui", "json", "sensitivity"],
+        choices=["tui", "json", "sensitivity", "sensitivity-json"],
         default="tui",
-        help="Output format (default: tui). 'sensitivity' shows grid cost vs target SOC.",
+        help="Output format (default: tui). 'sensitivity'/'sensitivity-json' shows grid cost vs target SOC.",
     )
     p.add_argument(
         "--target-soc",
@@ -391,6 +391,8 @@ def main():
         print(render_json(all_results))
     elif args.output == "sensitivity":
         print(render_sensitivity(prices, dummy_loads, initial_soc))
+    elif args.output == "sensitivity-json":
+        render_sensitivity_json(prices, dummy_loads, initial_soc)
     else:
         print(render_tui(all_results))
 
@@ -400,9 +402,36 @@ def main():
 
 def run_sensitivity(
     prices: list[dict], dummy_loads_kw: list[float], initial_soc: float
-) -> list[dict]:
-    """Run optimization for each target SOC level and collect results."""
-    results = []
+) -> dict:
+    """Run unconstrained + sensitivity optimization and return results.
+
+    Returns dict with:
+      - baseline: result from unconstrained optimization (no target SOC)
+      - points: list of dicts for each target SOC level (0-100%, step 5%)
+        with deltas vs baseline
+    """
+    # First, run unconstrained to find the "natural" optimal SOC
+    print("Running unconstrained optimization (baseline)...", file=sys.stderr)
+    try:
+        baseline_result = optimize(prices, dummy_loads_kw, initial_soc, target_soc=None)
+        baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
+        baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
+        baseline_cost_per_kwh = (
+            baseline_cost_pln / max(baseline_grid_kwh, 0.001)
+            if baseline_grid_kwh > 0
+            else 0
+        )
+        # Find what SOC the optimizer naturally chose
+        last_soc_pct = baseline_result["summary"]["final_soc"]
+    except Exception as e:
+        print(f"  [warn] Baseline optimization failed: {e}", file=sys.stderr)
+        baseline_cost_pln = 0
+        baseline_grid_kwh = 1
+        baseline_cost_per_kwh = 0
+        last_soc_pct = None
+
+    # Now run sensitivity for each target SOC level
+    points = []
     soc_levels = range(0, 105, 5)  # 0%, 5%, ..., 100%
 
     print(
@@ -417,66 +446,80 @@ def run_sensitivity(
                 prices, dummy_loads_kw, initial_soc, target_soc=target_soc
             )
             summary = result["summary"]
-            total_active_kwh = sum(
-                prices[h]["price"]
-                * (
-                    dummy_loads_kw[h]
-                    + result["decisions"][h].get("charge_wh", 0) / 1000
-                )
-                for h in range(len(prices))
-            ) / max(sum(dummy_loads_kw), 0.001)  # normalize by average load
+            total_cost_pln = summary["total_cost_pln"]
+            grid_kwh = summary["total_grid_kwh"]
+            cost_per_kwh = total_cost_pln / max(grid_kwh, 0.001) if grid_kwh > 0 else 0
 
-            results.append(
+            # Delta vs baseline
+            delta_cost_pln = total_cost_pln - baseline_cost_pln
+            delta_cost_per_kwh = cost_per_kwh - baseline_cost_per_kwh
+
+            points.append(
                 {
                     "target_soc": target_pct,
-                    "total_cost_pln": summary["total_cost_pln"],
-                    "grid_kwh": summary["total_grid_kwh"],
-                    "cost_per_kwh": summary["total_cost_pln"]
-                    / max(summary["total_grid_kwh"], 0.001),
+                    "total_cost_pln": round(total_cost_pln, 4),
+                    "grid_kwh": round(grid_kwh, 3),
+                    "cost_per_kwh": round(cost_per_kwh, 6),
+                    "delta_cost_pln": round(delta_cost_pln, 4),
+                    "delta_cost_per_kwh": round(delta_cost_per_kwh, 6),
                 }
             )
         except Exception as e:
             print(f"  [warn] Target SOC {target_pct}% failed: {e}", file=sys.stderr)
 
-    return results
+    return {
+        "baseline": {
+            "cost_pln": baseline_cost_pln,
+            "grid_kwh": baseline_grid_kwh,
+            "cost_per_kwh": round(baseline_cost_per_kwh, 6),
+            "final_soc_pct": last_soc_pct,
+        },
+        "points": points,
+    }
 
 
 def render_sensitivity(prices, dummy_loads_kw, initial_soc):
     """Render sensitivity analysis as ASCII bar chart."""
-    results = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+    data = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+    baseline = data["baseline"]
+    points = data["points"]
 
-    if not results:
+    if not points:
         print("No valid results from sensitivity analysis.", file=sys.stderr)
         return ""
 
-    # Find best (cheapest cost per kWh)
-    best_idx = min(range(len(results)), key=lambda i: results[i]["cost_per_kwh"])
-    best_cost = results[best_idx]["cost_per_kwh"]
+    # Find the point matching the natural optimal SOC (highlight in green)
+    best_target_pct = baseline["final_soc_pct"]
+    best_idx = None
+    for i, p in enumerate(points):
+        if abs(p["target_soc"] - best_target_pct) < 2.5:  # within ±2.5% tolerance
+            best_idx = i
+            break
 
     lines = []
-    sep = "─" * 70
+    sep = "─" * 80
 
     lines.append(f"\n  📊 Sensitivity Analysis — Grid Cost vs Target SOC")
     lines.append(sep)
     lines.append(
-        f"  {'Target SOC':>12} │ {'Grid Cost (PLN)':>15} │ {'Cost/kWh':>10} │ Bar"
+        f"  {'Target SOC':>12} │ {'Δ Grid Cost (PLN)':>17} │ {'Δ Cost/kWh':>12} │ Bar"
     )
-    lines.append("  " + "─" * 12 + "┼" + "─" * 15 + "┼" + "─" * 10 + "┼" + "─" * 30)
+    lines.append("  " + "─" * 12 + "┼" + "─" * 17 + "┼" + "─" * 12 + "┼" + "─" * 30)
 
     max_bar_width = 30
 
-    for i, r in enumerate(results):
-        target_str = f"{r['target_soc']:2d}%"
-        cost_str = f"{r['total_cost_pln']:+.4f}"
-        cpkwh_str = f"{r['cost_per_kwh']:.4f}"
+    for i, p in enumerate(points):
+        target_str = f"{p['target_soc']:2d}%"
+        delta_cost_str = f"{p['delta_cost_pln']:+.4f}"
+        delta_cpkwh_str = f"{p['delta_cost_per_kwh']:+.6f}"
 
-        # Bar length proportional to cost (normalize to max)
-        max_cost = max(abs(r["cost_per_kwh"]) for r in results) or 1
-        bar_len = int(abs(r["cost_per_kwh"]) / max_cost * max_bar_width)
+        # Bar length proportional to absolute delta (normalize to max)
+        max_delta = max(abs(p["delta_cost_pln"]) for p in points) or 1
+        bar_len = int(abs(p["delta_cost_pln"]) / max_delta * max_bar_width)
         bar_len = max(0, min(bar_len, max_bar_width))
 
         if i == best_idx:
-            color = "\033[92m"  # green for cheapest
+            color = "\033[92m"  # green for natural optimal SOC
             marker = " ★"
         else:
             color = "\033[90m"  # gray for others
@@ -485,17 +528,26 @@ def render_sensitivity(prices, dummy_loads_kw, initial_soc):
         bar = "█" * bar_len + "." * (max_bar_width - bar_len)
         reset = "\033[0m"
 
-        line = f"  {color}{target_str:>12}{reset} │ {cost_str:>15} │ {cpkwh_str:>10} │{color}{bar}{reset}{marker}"
+        line = f"  {color}{target_str:>12}{reset} │ {delta_cost_str:>17} │ {delta_cpkwh_str:>12} │{color}{bar}{reset}{marker}"
         lines.append(line)
 
     lines.append(sep)
-    lines.append(f"\n  ★ = Cheapest option (lowest cost per kWh)")
-    lines.append(
-        f"  Best target SOC: {results[best_idx]['target_soc']}% @ {results[best_idx]['cost_per_kwh']:.4f} PLN/kWh"
-    )
+    lines.append(f"\n  ★ = Natural optimal SOC (from unconstrained optimization)")
+    if best_target_pct is not None:
+        lines.append(
+            f"  Baseline cost: {baseline['cost_pln']:+.4f} PLN ({baseline['cost_per_kwh']:.6f} PLN/kWh) at {best_target_pct:.0f}% SOC"
+        )
+    else:
+        lines.append(f"  Baseline cost: {baseline['cost_pln']:+.4f} PLN")
     lines.append("")
 
     return "\n".join(lines)
+
+
+def render_sensitivity_json(prices, dummy_loads_kw, initial_soc):
+    """Render sensitivity analysis as JSON."""
+    data = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+    print(json.dumps(data, indent=2))
 
 
 if __name__ == "__main__":
