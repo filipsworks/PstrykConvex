@@ -104,9 +104,15 @@ def optimize(
 
         # Variables are in kW, 1-hour window → Wh for charge/discharge
         # Charge: grid→battery (already at battery side after efficiency in SOC)
-        charge_wh = ch_val * 1000
+        charge_wh = round(ch_val * 1000, 2)
         # Discharge: battery→inverter→loads; report battery-side energy (÷η_inv)
-        discharge_wh = dis_val / DISCHARGE_EFFICIENCY * 1000
+        discharge_wh = round(dis_val / DISCHARGE_EFFICIENCY * 1000, 2)
+
+        # Treat tiny values as zero (floating point noise)
+        if charge_wh < 0.5:
+            charge_wh = 0.0
+        if discharge_wh < 0.5:
+            discharge_wh = 0.0
 
         total_charge_wh += charge_wh
         total_discharge_wh += discharge_wh
@@ -159,6 +165,7 @@ def optimize(
         "cycled_pct": round((total_discharge_wh / capacity_wh) * 100, 2),
         "total_grid_kwh": round(total_grid_kwh, 3),
         "total_cost_pln": round(total_cost_pln, 4),
+        "final_soc": round(soc_val * 100, 1),
     }
 
     return {"decisions": decisions, "summary": summary}
