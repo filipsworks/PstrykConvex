@@ -81,7 +81,8 @@ def optimize(
         constraints.append(soc[h + 1] <= MAX_SOC)
 
     problem = cp.Problem(objective, constraints)
-    problem.solve(solver=cp.OSQP, verbose=False)
+    # HIGHS is a robust LP/MIP solver — much better than OSQP for this problem
+    problem.solve(solver=cp.HIGHS, verbose=False)
 
     if problem.status not in ("optimal", "optimal_inaccurate"):
         raise RuntimeError(f"Optimization failed: {problem.status}")
