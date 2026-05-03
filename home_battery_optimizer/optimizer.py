@@ -5,10 +5,13 @@ import sys
 import cvxpy as cp
 import numpy as np
 from battery_model import (
+    CAPACITY_AH,
     CHARGE_EFFICIENCY,
+    CHARGE_STEPS_A,
     DISCHARGE_EFFICIENCY,
     MAX_SOC,
     MIN_SOC,
+    NOMINAL_VOLTAGE,
     TOTAL_CAPACITY_WH,
     max_charge_power_kw,
 )
@@ -44,7 +47,7 @@ def optimize(
     max_p_charge_kw = min(max_charge_power_kw(), 2.0)  # cap at ~1.8 kW practical
 
     # Max discharge rate: C/2 → ~2.08 kW conservative
-    max_discharge_kw = NOMINAL_V * CAPACITY_AH / 1000 * 0.5
+    max_discharge_kw = NOMINAL_VOLTAGE * CAPACITY_AH / 1000 * 0.5
 
     # --- Variables (all continuous, nonnegative) ---
     charge = cp.Variable(HOURS, nonneg=True)  # kW from grid to battery
@@ -101,6 +104,22 @@ def optimize(
     if problem.status not in ("optimal", "optimal_inaccurate"):
         raise RuntimeError(f"Optimization failed: {problem.status}")
 
+    # --- Snap charge power to discrete 10A steps (260W at nominal voltage) ---
+    # Since CVXPY/HIGHS doesn't support integer variables, we post-process the LP solution.
+    # Each hour's charge power is rounded to the nearest allowed step: 0, 10, 20, ..., 70A.
+    def snap_to_charge_step(power_kw: float) -> tuple[float, int]:
+        """Snap continuous power (kW) to nearest discrete charging step.
+
+        Returns (snapped_power_kw, charge_amps).
+        """
+        if power_kw < 0.13:  # below 5A threshold → treat as zero
+            return 0.0, 0
+        # Convert kW → A at nominal voltage
+        current_a = power_kw * 1000 / NOMINAL_VOLTAGE
+        # Find nearest step
+        best_step = min(CHARGE_STEPS_A, key=lambda s: abs(s - current_a))
+        return best_step * NOMINAL_VOLTAGE / 1000, best_step
+
     # --- Build results ---
     decisions = []
     total_charge_wh = 0.0
@@ -117,27 +136,29 @@ def optimize(
             float(soc[h + 1].value) if soc[h + 1].value is not None else initial_soc
         )
 
-        # Variables are in kW, 1-hour window → Wh for charge/discharge
-        # Charge: grid→battery (already at battery side after efficiency in SOC)
-        charge_wh = round(ch_val * 1000, 2)
+        # Snap charge power to discrete 10A steps and compute Wh from snapped value
+        ch_kw_snapped, charge_amps = snap_to_charge_step(ch_val)
+        charge_wh = round(ch_kw_snapped * 1000, 2)  # kW × 1h → Wh
+
         # Discharge: battery→inverter→loads; report battery-side energy (÷η_inv)
         discharge_wh = round(dis_val / DISCHARGE_EFFICIENCY * 1000, 2)
 
         # Treat tiny values as zero (floating point noise)
         if charge_wh < 0.5:
             charge_wh = 0.0
+            charge_amps = 0
         if discharge_wh < 0.5:
             discharge_wh = 0.0
 
         total_charge_wh += charge_wh
         total_discharge_wh += discharge_wh
-        # Grid energy: kW × 1h = kWh
-        total_grid_kwh += gl_val + ch_val
-        # Cost: PLN/kWh × kW × 1h = PLN
-        total_cost_pln += price_array[h] * (gl_val + ch_val)
+        # Grid energy: kW × 1h = kWh (use snapped value for accuracy)
+        total_grid_kwh += gl_val + ch_kw_snapped
+        # Cost: PLN/kWh × kW × 1h = PLN (use snapped value for accuracy)
+        total_cost_pln += price_array[h] * (gl_val + ch_kw_snapped)
 
         # Determine mode pair from solution values:
-        is_charging = ch_val > 0.01
+        is_charging = charge_amps > 0
         is_discharging = dis_val > 0.01 and gl_val < dummy_loads_kw[h] * 0.99
 
         if is_charging:
@@ -155,12 +176,10 @@ def optimize(
             charger_mode = "OSO"
 
         # Total active power cost: price × (dummy loads + charge from grid)
-        # This shows what the hour costs regardless of battery mode,
-        # so you can compare SUB vs SBU decisions at a glance.
-        total_active_kw = dummy_loads_kw[h] + ch_val
+        total_active_kw = dummy_loads_kw[h] + ch_kw_snapped
         total_cost_pln_hour = price_array[h] * total_active_kw
 
-        grid_cost = price_array[h] * (gl_val + ch_val)  # actual grid spend
+        grid_cost = price_array[h] * (gl_val + ch_kw_snapped)  # actual grid spend
 
         decisions.append(
             {
@@ -169,6 +188,7 @@ def optimize(
                 "charger_mode": charger_mode,
                 "charge_wh": charge_wh,
                 "discharge_wh": discharge_wh,
+                "charge_amps": charge_amps,  # discrete charging step (0 or 10-70)
                 "soc_pct": round(soc_val * 100, 1),
                 "grid_cost_pln": round(grid_cost, 4),
                 "total_active_kw": round(total_active_kw, 3),
@@ -188,8 +208,3 @@ def optimize(
     }
 
     return {"decisions": decisions, "summary": summary}
-
-
-# Module-level constants needed in optimize()
-NOMINAL_V = 26.0
-CAPACITY_AH = 320

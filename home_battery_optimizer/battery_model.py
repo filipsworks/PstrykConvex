@@ -18,6 +18,9 @@ CHARGE_EFFICIENCY = 0.95  # BMS + wiring losses during charge
 DISCHARGE_EFFICIENCY = 0.95  # inverter losses during discharge
 ROUND_TRIP_EFFICIENCY = CHARGE_EFFICIENCY * DISCHARGE_EFFICIENCY
 
+# Discrete charging steps: 10A-70A in 10A increments (minimum practical charge)
+CHARGE_STEPS_A = [0, 10, 20, 30, 40, 50, 60, 70]
+
 # Derived
 TOTAL_CAPACITY_WH = NOMINAL_VOLTAGE * CAPACITY_AH  # ~8320 Wh (V × Ah = Wh)
 USABLE_CAPACITY_WH = TOTAL_CAPACITY_WH * (MAX_SOC - MIN_SOC)

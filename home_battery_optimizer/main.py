@@ -204,7 +204,7 @@ def render_tui(all_results: list[dict]) -> str:
             8, max(len(d["output_mode"] + "/" + d["charger_mode"]) for d in decisions)
         )
         price_w = 7
-        charge_w = 10  # e.g. "+1.82 kWh" or "-1.44 kWh"
+        charge_w = 14  # e.g. "+1.82 kWh @ 70A" or "-1.44 kWh"
         soc_w = 7  # " 35.0%"
         grid_cost_w = 9  # actual grid spend: "    0.6504"
         total_cost_w = 9  # total active power cost: "    1.2840"
@@ -258,14 +258,15 @@ def render_tui(all_results: list[dict]) -> str:
             mode_str = f"{d['output_mode']}/{d['charger_mode']}"
             price_str = f"{d['price_plkwh']:.3f}"
 
-            # Charge/discharge value with sign
+            # Charge/discharge value with sign and amps (for charging)
             ch_kwh = d["charge_kwh"]  # positive = charge, negative = discharge
+            charge_amps = d.get("charge_amps", 0)
             if abs(ch_kwh) < 0.005:
                 charge_str = "    idle"
                 bar_str = "." * bar_width
                 color = "\033[90m"  # gray
             elif ch_kwh > 0:
-                charge_str = f"+{ch_kwh:.2f} kWh"
+                charge_str = f"+{ch_kwh:.2f} kWh @ {charge_amps}A"
                 blen = max(1, int(ch_kwh / max_abs * bar_width))
                 bar_str = "█" * blen + "." * (bar_width - blen)
                 color = "\033[92m"  # green
@@ -283,7 +284,7 @@ def render_tui(all_results: list[dict]) -> str:
             line = (
                 f"  {hour:3d}│{color}{mode_str:<{mode_w}}{reset}│"
                 f" {price_str:>6} │"
-                f"{color}{bar_str}{reset} {charge_str:>10s} │"
+                f"{color}{bar_str}{reset} {charge_str:>14s} │"
                 f" {soc_str:>5s} │"
                 f" {grid_cost_str:>{grid_cost_w}} │"
                 f" {total_cost_str:>{total_cost_w}}"
