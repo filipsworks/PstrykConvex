@@ -186,7 +186,7 @@ def get_data(args):
 # ── TUI rendering ──────────────────────────────────────────────────────────
 
 
-def render_tui(all_results: list[dict]) -> str:
+def render_tui(all_results: list[dict], horizon: str = "available") -> str:
     """Render multi-day results as aligned ASCII table with colored bars."""
     lines = []
     sep = "─" * 80
@@ -194,7 +194,11 @@ def render_tui(all_results: list[dict]) -> str:
     for day_idx, result in enumerate(all_results):
         decisions = result["decisions"]
         summary = result["summary"]
-        date_label = f"Day {day_idx + 1}" if len(all_results) > 1 else "Today"
+        # Use horizon-based label for single-result runs; otherwise Day N
+        if len(all_results) == 1 and horizon != "available":
+            date_label = horizon.capitalize()
+        else:
+            date_label = f"Day {day_idx + 1}"
 
         lines.append(f"\n  📅 {date_label}")
         lines.append(sep)
@@ -395,7 +399,7 @@ def main():
     elif args.output == "sensitivity-json":
         render_sensitivity_json(prices, dummy_loads, initial_soc)
     else:
-        print(render_tui(all_results))
+        print(render_tui(all_results, horizon=args.horizon))
 
 
 # ── Sensitivity analysis ───────────────────────────────────────────────────
