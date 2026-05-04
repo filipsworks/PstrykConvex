@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Home battery charging optimizer — CLI entry point with TUI / JSON output."""
 
-import argparse
 import json
-import sys
-from datetime import datetime, timezone
 
+import click
 from api import fetch_all_data
-from battery_model import TOTAL_CAPACITY_WH, voltage_to_soc
+from battery_model import voltage_to_soc
 from optimizer import optimize
 
 # ── Mock data (used when --mock or API unavailable) ────────────────────────
@@ -70,64 +68,160 @@ MOCK_DUMMY_LOADS = [
 # ── CLI parsing ────────────────────────────────────────────────────────────
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Home battery charging optimizer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
-Examples:
-  # Mock run (no API):
-  %(prog)s --mock
+@click.command(
+    context_settings={"max_content_width": 120},
+    epilog=(
+        "Mode legend:\n"
+        "  SUB/SNU — loads on grid + charge battery from grid (cheap hours)\n"
+        "  SBU/OSO — loads on battery, no charging (default)\n"
+        "  SUB/OSO — loads on grid, no charging (idle battery)"
+    ),
+)
+@click.option("--mock", is_flag=True, help="Use sample data instead of API")
+@click.option(
+    "--ha-url",
+    default="https://ha-finland.kompfix.pl",
+    show_default=True,
+    help="Home Assistant base URL (e.g. https://ha-finland.kompfix.pl). /api is appended automatically.",
+)
+@click.option(
+    "--ha-token",
+    default="",
+    show_default=False,
+    help="Long-lived access token (required unless --mock)",
+)
+@click.option(
+    "--horizon",
+    type=click.Choice(["today", "tomorrow", "available"]),
+    default="available",
+    show_default=True,
+    help="Which day's prices to optimize for (default: available)",
+)
+@click.option(
+    "--days",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of days to fetch history for (default: 1)",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["tui", "json", "sensitivity", "sensitivity-json"]),
+    default="tui",
+    show_default=True,
+    help="Output format (default: tui). 'sensitivity'/'sensitivity-json' shows grid cost vs target SOC.",
+)
+@click.option(
+    "--target-soc",
+    type=float,
+    default=None,
+    metavar="PCT",
+    help="Target end-of-day SOC in percent (0–100). Default: no constraint.",
+)
+@click.pass_context
+def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
+    r"""Home battery charging optimizer.
 
-  # Live data, today's prices, TUI output:
-  %(prog)s --ha-url https://ha.example.com --ha-token YOUR_TOKEN
+    Examples:
 
-  # JSON output for tomorrow, last 3 days of history:
-  %(prog)s --ha-url ... --ha-token ... --horizon tomorrow --days 3 --output json
+      # Mock run (no API):
+      %(prog)s --mock
 
-Mode legend:
-  SUB/SNU — loads on grid + charge battery from grid (cheap hours)
-  SBU/OSO — loads on battery, no charging (default)
-  SUB/OSO — loads on grid, no charging (idle battery)
-""",
+      # Live data, today's prices, TUI output:
+      %(prog)s --ha-url https://ha.example.com --ha-token YOUR_TOKEN
+
+      # JSON output for tomorrow, last 3 days of history:
+      %(prog)s --ha-url ... --ha-token ... --horizon tomorrow --days 3 --output json
+    """
+    # Validate: either --mock or both --ha-url and --ha-token required
+    if not mock and not ha_token:
+        click.echo(
+            "[error] Either --mock or --ha-token is required. Use --help for usage.",
+            err=True,
+        )
+        ctx.exit(1)
+
+    # Build a simple namespace-like object to keep get_data / downstream code unchanged
+    args = type(
+        "Args",
+        (),
+        {
+            "mock": mock,
+            "ha_url": ha_url,
+            "ha_token": ha_token,
+            "horizon": horizon,
+            "days": days,
+            "output": output,
+            "target_soc": target_soc,
+        },
+    )()
+
+    # Fetch data
+    prices, dummy_loads, initial_soc = get_data(args)
+
+    # Warn if tomorrow's pricing is estimated (cloned from today)
+    if _has_estimated_prices(prices):
+        click.echo(
+            "[warn] Tomorrow's pricing data unavailable — using today's prices as estimation",
+            err=True,
+        )
+
+    # Run optimization for each day in the horizon
+    all_results = []
+    n_days = (
+        1
+        if args.horizon == "today"
+        else (2 if args.horizon == "tomorrow" else len(prices) // 24 + 1)
     )
-    p.add_argument("--mock", action="store_true", help="Use sample data instead of API")
-    p.add_argument(
-        "--ha-url",
-        default="https://ha-finland.kompfix.pl",
-        help="Home Assistant base URL (e.g. https://ha-finland.kompfix.pl). /api is appended automatically.",
-    )
-    p.add_argument(
-        "--ha-token",
-        default="",
-        help="Long-lived access token (required unless --mock)",
-    )
-    p.add_argument(
-        "--horizon",
-        choices=["today", "tomorrow", "available"],
-        default="available",
-        help="Which day's prices to optimize for (default: available)",
-    )
-    p.add_argument(
-        "--days",
-        type=int,
-        default=1,
-        help="Number of days to fetch history for (default: 1)",
-    )
-    p.add_argument(
-        "--output",
-        choices=["tui", "json", "sensitivity", "sensitivity-json"],
-        default="tui",
-        help="Output format (default: tui). 'sensitivity'/'sensitivity-json' shows grid cost vs target SOC.",
-    )
-    p.add_argument(
-        "--target-soc",
-        type=float,
-        default=None,
-        metavar="PCT",
-        help="Target end-of-day SOC in percent (0–100). Default: no constraint.",
-    )
-    return p.parse_args()
+    # Actually, prices is always 24h. For multi-day we'd need more data.
+    # For now, optimize one day at a time from the price list.
+    for i in range(min(n_days, len(prices) // 24)):
+        start = i * 24
+        end = min(start + 24, len(prices))
+        if start >= end:
+            break
+        day_prices = prices[start:end]
+        # Pad or slice dummy loads to match
+        day_loads = (dummy_loads * ((end - start) // len(dummy_loads) + 1))[start:end]
+
+        soc_start = (
+            initial_soc
+            if i == 0
+            else all_results[-1]["summary"]["final_soc"]
+            if all_results
+            else initial_soc
+        )
+
+        # Convert target SOC from percent to fraction (0–1)
+        target_soc_val = args.target_soc / 100 if args.target_soc is not None else None
+
+        try:
+            result = optimize(
+                day_prices, day_loads, soc_start, target_soc=target_soc_val
+            )
+        except Exception as e:
+            click.echo(f"[error] Optimization failed for day {i + 1}: {e}", err=True)
+            ctx.exit(1)
+
+        # Inject charge_kwh (signed) into each decision
+        for d in result["decisions"]:
+            d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
+
+        # Propagate estimated pricing flag into results (for JSON output)
+        if _has_estimated_prices(day_prices):
+            result["is_estimated"] = True
+
+        all_results.append(result)
+
+    # Output
+    if args.output == "json":
+        click.echo(render_json(all_results))
+    elif args.output == "sensitivity":
+        click.echo(render_sensitivity(prices, dummy_loads, initial_soc))
+    elif args.output == "sensitivity-json":
+        render_sensitivity_json(prices, dummy_loads, initial_soc)
+    else:
+        click.echo(render_tui(all_results, horizon=args.horizon))
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
@@ -144,14 +238,14 @@ def _build_base_url(ha_url: str) -> str:
 def get_data(args):
     """Return (prices, dummy_loads, initial_soc) for the requested horizon."""
     if args.mock:
-        print("[mock] Using sample data", file=sys.stderr)
+        click.echo("[mock] Using sample data", err=True)
         prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
         dummy_loads = MOCK_DUMMY_LOADS
         initial_soc = 0.35
     else:
         base_url = _build_base_url(args.ha_url)
 
-        print(f"Fetching data from {base_url} ...", file=sys.stderr)
+        click.echo(f"Fetching data from {base_url} ...", err=True)
         try:
             import api as api_mod
 
@@ -162,7 +256,7 @@ def get_data(args):
                 horizon=args.horizon,
             )
         except Exception as e:
-            print(f"[error] API failed ({e}), falling back to mock", file=sys.stderr)
+            click.echo(f"[error] API failed ({e}), falling back to mock", err=True)
             prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
             dummy_loads = MOCK_DUMMY_LOADS
             initial_soc = 0.35
@@ -172,13 +266,13 @@ def get_data(args):
             voltage = data.get("voltage")
             if voltage is not None:
                 initial_soc = voltage_to_soc(voltage)
-                print(
+                click.echo(
                     f"  Voltage {voltage:.1f} V → SOC {initial_soc * 100:.1f}%",
-                    file=sys.stderr,
+                    err=True,
                 )
             else:
                 initial_soc = 0.5
-                print("  No voltage reading — defaulting to SOC 50%", file=sys.stderr)
+                click.echo("  No voltage reading — defaulting to SOC 50%", err=True)
 
     return prices, dummy_loads, initial_soc
 
@@ -338,86 +432,6 @@ def render_json(all_results: list[dict]) -> str:
     return json.dumps(all_results, indent=2)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
-
-
-def main():
-    args = parse_args()
-
-    # Validate: either --mock or both --ha-url and --ha-token required
-    if not args.mock and not args.ha_token:
-        print(
-            "[error] Either --mock or --ha-token is required. Use --help for usage.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Fetch data
-    prices, dummy_loads, initial_soc = get_data(args)
-
-    # Warn if tomorrow's pricing is estimated (cloned from today)
-    if _has_estimated_prices(prices):
-        print(
-            "[warn] Tomorrow's pricing data unavailable — using today's prices as estimation",
-            file=sys.stderr,
-        )
-
-    # Run optimization for each day in the horizon
-    all_results = []
-    n_days = (
-        1
-        if args.horizon == "today"
-        else (2 if args.horizon == "tomorrow" else len(prices) // 24 + 1)
-    )
-    # Actually, prices is always 24h. For multi-day we'd need more data.
-    # For now, optimize one day at a time from the price list.
-    for i in range(min(n_days, len(prices) // 24)):
-        start = i * 24
-        end = min(start + 24, len(prices))
-        if start >= end:
-            break
-        day_prices = prices[start:end]
-        # Pad or slice dummy loads to match
-        day_loads = (dummy_loads * ((end - start) // len(dummy_loads) + 1))[start:end]
-
-        soc_start = (
-            initial_soc
-            if i == 0
-            else all_results[-1]["summary"]["final_soc"]
-            if all_results
-            else initial_soc
-        )
-
-        # Convert target SOC from percent to fraction (0–1)
-        target_soc = args.target_soc / 100 if args.target_soc is not None else None
-
-        try:
-            result = optimize(day_prices, day_loads, soc_start, target_soc=target_soc)
-        except Exception as e:
-            print(f"[error] Optimization failed for day {i + 1}: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        # Inject charge_kwh (signed) into each decision
-        for d in result["decisions"]:
-            d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
-
-        # Propagate estimated pricing flag into results (for JSON output)
-        if _has_estimated_prices(day_prices):
-            result["is_estimated"] = True
-
-        all_results.append(result)
-
-    # Output
-    if args.output == "json":
-        print(render_json(all_results))
-    elif args.output == "sensitivity":
-        print(render_sensitivity(prices, dummy_loads, initial_soc))
-    elif args.output == "sensitivity-json":
-        render_sensitivity_json(prices, dummy_loads, initial_soc)
-    else:
-        print(render_tui(all_results, horizon=args.horizon))
-
-
 # ── Sensitivity analysis ───────────────────────────────────────────────────
 
 
@@ -432,7 +446,7 @@ def run_sensitivity(
         with deltas vs baseline
     """
     # First, run unconstrained to find the "natural" optimal SOC
-    print("Running unconstrained optimization (baseline)...", file=sys.stderr)
+    click.echo("Running unconstrained optimization (baseline)...", err=True)
     try:
         baseline_result = optimize(prices, dummy_loads_kw, initial_soc, target_soc=None)
         baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
@@ -445,7 +459,7 @@ def run_sensitivity(
         # Find what SOC the optimizer naturally chose
         last_soc_pct = baseline_result["summary"]["final_soc"]
     except Exception as e:
-        print(f"  [warn] Baseline optimization failed: {e}", file=sys.stderr)
+        click.echo(f"  [warn] Baseline optimization failed: {e}", err=True)
         baseline_cost_pln = 0
         baseline_grid_kwh = 1
         baseline_cost_per_kwh = 0
@@ -455,9 +469,9 @@ def run_sensitivity(
     points = []
     soc_levels = range(0, 105, 5)  # 0%, 5%, ..., 100%
 
-    print(
+    click.echo(
         f"Running sensitivity analysis ({len(soc_levels)} scenarios)...",
-        file=sys.stderr,
+        err=True,
     )
 
     for target_pct in soc_levels:
@@ -486,7 +500,7 @@ def run_sensitivity(
                 }
             )
         except Exception as e:
-            print(f"  [warn] Target SOC {target_pct}% failed: {e}", file=sys.stderr)
+            click.echo(f"  [warn] Target SOC {target_pct}% failed: {e}", err=True)
 
     return {
         "baseline": {
@@ -506,7 +520,7 @@ def render_sensitivity(prices, dummy_loads_kw, initial_soc):
     points = data["points"]
 
     if not points:
-        print("No valid results from sensitivity analysis.", file=sys.stderr)
+        click.echo("No valid results from sensitivity analysis.", err=True)
         return ""
 
     # Find the point matching the natural optimal SOC (highlight in green)
@@ -568,7 +582,7 @@ def render_sensitivity(prices, dummy_loads_kw, initial_soc):
 def render_sensitivity_json(prices, dummy_loads_kw, initial_soc):
     """Render sensitivity analysis as JSON."""
     data = run_sensitivity(prices, dummy_loads_kw, initial_soc)
-    print(json.dumps(data, indent=2))
+    click.echo(json.dumps(data, indent=2))
 
 
 if __name__ == "__main__":
