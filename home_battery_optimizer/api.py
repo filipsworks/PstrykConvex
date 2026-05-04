@@ -31,10 +31,12 @@ def fetch_hourly_prices(
     data = resp.json()
 
     prices_attr = data.get("attributes", {})
+    is_estimated = False  # default: not estimated
 
     if horizon == "today":
         raw_prices = prices_attr.get("today_prices", [])
     elif horizon == "tomorrow":
+        is_estimated = False
         raw_prices = prices_attr.get("tomorrow_prices", [])
         # If today's sensor doesn't have tomorrow_prices, try the dedicated sensor
         if not raw_prices:
@@ -45,6 +47,11 @@ def fetch_hourly_prices(
             resp2.raise_for_status()
             data2 = resp2.json()
             raw_prices = data2.get("attributes", {}).get("tomorrow_prices", [])
+
+        # If still no tomorrow data, clone today's prices as estimation fallback
+        if not raw_prices:
+            is_estimated = True
+            raw_prices = prices_attr.get("today_prices", [])
     else:  # "available"
         raw_prices = prices_attr.get("today_prices", [])
         if not raw_prices:
@@ -60,14 +67,15 @@ def fetch_hourly_prices(
     for p in raw_prices:
         start_dt = datetime.fromisoformat(p["start"])
         hour = start_dt.hour
-        result.append(
-            {
-                "hour": hour,
-                "price": float(p["price"]),
-                "is_cheap": bool(p.get("is_cheap", False)),
-                "is_expensive": bool(p.get("is_expensive", False)),
-            }
-        )
+        entry = {
+            "hour": hour,
+            "price": float(p["price"]),
+            "is_cheap": bool(p.get("is_cheap", False)),
+            "is_expensive": bool(p.get("is_expensive", False)),
+        }
+        if is_estimated:
+            entry["is_estimated"] = True
+        result.append(entry)
 
     # Sort by hour and fill any missing hours with average
     result.sort(key=lambda x: x["hour"])

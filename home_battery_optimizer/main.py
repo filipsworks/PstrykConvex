@@ -183,6 +183,11 @@ def get_data(args):
     return prices, dummy_loads, initial_soc
 
 
+def _has_estimated_prices(prices: list[dict]) -> bool:
+    """Check if any price entry is marked as estimated (cloned from today)."""
+    return any(p.get("is_estimated", False) for p in prices)
+
+
 # ── TUI rendering ──────────────────────────────────────────────────────────
 
 
@@ -350,6 +355,13 @@ def main():
     # Fetch data
     prices, dummy_loads, initial_soc = get_data(args)
 
+    # Warn if tomorrow's pricing is estimated (cloned from today)
+    if _has_estimated_prices(prices):
+        print(
+            "[warn] Tomorrow's pricing data unavailable — using today's prices as estimation",
+            file=sys.stderr,
+        )
+
     # Run optimization for each day in the horizon
     all_results = []
     n_days = (
@@ -388,6 +400,10 @@ def main():
         # Inject charge_kwh (signed) into each decision
         for d in result["decisions"]:
             d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
+
+        # Propagate estimated pricing flag into results (for JSON output)
+        if _has_estimated_prices(day_prices):
+            result["is_estimated"] = True
 
         all_results.append(result)
 
