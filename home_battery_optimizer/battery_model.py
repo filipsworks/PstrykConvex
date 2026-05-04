@@ -9,7 +9,9 @@ CAPACITY_AH = 320  # Ah — cell capacity
 MIN_SOC = 0.10  # 10% depth of discharge
 MAX_SOC = 0.95  # 95% top of charge
 
-# Voltage range for linear SOC mapping
+# Voltage range for linear SOC mapping (8s LiFePo4 pack)
+# 24.0 V = 0% SOC (cutoff), 28.0 V = 100% SOC (full charge)
+# Voltages above 28.0 V can occur during active charging — voltage_to_soc clamps to 100%.
 VOLTAGE_MIN = 24.0  # V → 0% SOC
 VOLTAGE_MAX = 28.0  # V → 100% SOC
 
