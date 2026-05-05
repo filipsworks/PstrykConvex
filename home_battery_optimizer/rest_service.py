@@ -272,10 +272,16 @@ def optimize_endpoint():
     target_soc = None
     if target_soc_raw is not None:
         try:
-            target_soc = float(target_soc_raw) / 100.0
+            val = float(target_soc_raw)
+            if val == -1:
+                pass  # -1 means no constraint, same as omitting the param
+            else:
+                target_soc = val / 100.0
         except (ValueError, TypeError):
             return jsonify(
-                {"error": "target_soc must be a number between 0 and 100"}
+                {
+                    "error": "target_soc must be a number between 0 and 100, or -1 for no constraint"
+                }
             ), 400
 
     if target_soc is not None and not (0 <= target_soc <= 1):

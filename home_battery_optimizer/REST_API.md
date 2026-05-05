@@ -75,7 +75,7 @@ Run the charging optimization and return JSON results.
 | `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
 | `horizon` | enum | `available` | No | Which day's prices to optimize: `today`, `tomorrow`, or `available` |
 | `days` | integer | `1` | No | Number of days of history to fetch for load estimation |
-| `target_soc` | float | *(none)* | No | Target end-of-day SOC in percent (0–100). If omitted, optimizer chooses freely. |
+| `target_soc` | float | *(none)* | No | Target end-of-day SOC in percent (0–100). If omitted or `-1`, optimizer chooses freely. |
 
 **Response:**
 
