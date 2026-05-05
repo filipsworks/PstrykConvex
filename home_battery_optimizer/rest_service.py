@@ -361,7 +361,22 @@ def health():
 
 # ── ASGI wrapper for uvicorn (Flask is WSGI, uvicorn expects ASGI) ────────
 
-from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+try:
+    from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+except ImportError:
+    try:
+        from uvicorn.middleware.wsgi import WSGIMiddleware  # noqa: E402
+    except ImportError:
+        raise RuntimeError(
+            "Neither 'starlette' nor 'uvicorn[standard]' is installed. "
+            "Install one of these to run with uvicorn:\n"
+            "  pip install starlette\n"
+            "or\n"
+            "  pip install uvicorn[standard]\n"
+            "\n"
+            "Alternatively, use Flask's built-in server:\n"
+            "  python rest_service.py [--host 0.0.0.0] [--port 8000]"
+        )
 
 asgi_app = WSGIMiddleware(app)
 
