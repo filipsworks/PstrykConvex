@@ -7,10 +7,16 @@ Flask-based REST service wrapping the home battery charging optimizer. Accepts a
 ```bash
 cd home_battery_optimizer
 source ../.venv/bin/activate
-python rest_service.py
+python rest_service.py [--host 0.0.0.0] [--port 8000] [--debug]
 ```
 
-The server starts on `http://localhost:8000`.
+| Argument | Default | Description |
+|---|---|---|
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Port to listen on |
+| `--debug` | *(off)* | Enable Flask debug mode |
+
+The server starts on `http://<host>:<port>`.
 
 ## Endpoints
 
