@@ -18,6 +18,30 @@ python rest_service.py [--host 0.0.0.0] [--port 8000] [--debug]
 
 The server starts on `http://<host>:<port>`.
 
+## Persistence (auto-restart)
+
+The service includes a `run.sh` wrapper that automatically uses **supervisor** for crash recovery when it's installed. Supervisor restarts the process on exit, crash, or abnormal termination.
+
+```bash
+cd home_battery_optimizer
+
+# Install supervisor (one-time):
+source ../.venv/bin/activate && pip install supervisor
+
+# Start — supervisor is used automatically if available:
+./run.sh [--host 0.0.0.0] [--port 8000] [--debug]
+```
+
+**How it works:**
+
+| Scenario | Behavior |
+|---|---|
+| `supervisor` installed | Runs under supervisord with `autorestart=true` (automatic crash recovery) |
+| `supervisor` not installed | Falls back to direct execution with a warning message |
+| `./run.sh supervisor` | Forces supervisor mode (fails if not installed) |
+
+The generated config (`supervisord.generated.conf`) is written to disk at startup and ignored by git.
+
 ## Endpoints
 
 ### `GET /health`
