@@ -1,20 +1,27 @@
 # Home Battery Optimizer — REST API
 
-Flask-based REST service wrapping the home battery charging optimizer. Accepts all CLI arguments as query parameters and returns JSON-only output.
+Flask-based REST service wrapping the home battery charging optimizer. Accepts all CLI arguments as query parameters and returns JSON-only output. Served via uvicorn (ASGI) with a WSGI bridge for Flask compatibility.
 
 ## Quick Start
 
 ```bash
 cd home_battery_optimizer
 source ../.venv/bin/activate
+pip install -r requirements.txt  # includes uvicorn, starlette, flask
 python rest_service.py [--host 0.0.0.0] [--port 8000] [--debug]
+```
+
+Or directly with uvicorn:
+
+```bash
+uvicorn rest_service:asgi_app --host 0.0.0.0 --port 8000
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8000` | Port to listen on |
-| `--debug` | *(off)* | Enable Flask debug mode |
+| `--host` | `0.0.0.0` | Bind address (for direct mode) |
+| `--port` | `8000` | Port to listen on (for direct mode) |
+| `--debug` | *(off)* | Enable Flask debug mode (for direct mode) |
 
 The server starts on `http://<host>:<port>`.
 
@@ -37,7 +44,7 @@ source ../.venv/bin/activate && pip install supervisor
 | Scenario | Behavior |
 |---|---|
 | `supervisor` installed | Runs under supervisord with `autorestart=true` (automatic crash recovery) |
-| `supervisor` not installed | Falls back to direct execution with a warning message |
+| `supervisor` not installed | Falls back to direct uvicorn execution with a warning message |
 | `./run.sh supervisor` | Forces supervisor mode (fails if not installed) |
 
 The generated config (`supervisord.generated.conf`) is written to disk at startup and ignored by git.

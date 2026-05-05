@@ -2,7 +2,7 @@
 # Start the Home Battery Optimizer REST service with automatic persistence.
 #
 # If supervisor is installed, runs under it (auto-restart on crash).
-# Otherwise falls back to direct execution.
+# Otherwise falls back to direct execution via uvicorn.
 #
 # Usage:
 #   ./run.sh                  # start directly
@@ -21,13 +21,13 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 PYTHON="$VENV_DIR/bin/python"
+UVICORN="$VENV_DIR/bin/uvicorn"
 
 # Check if supervisor is available
 HAS_SUPERVISOR=false
 if command -v supervisord &>/dev/null; then
     HAS_SUPERVISOR=true
 elif "$PYTHON" -c "import supervisor" 2>/dev/null; then
-    # Find the supervisord binary inside the venv
     SUPERVISORD_BIN="$VENV_DIR/bin/supervisord"
     if [[ -x "$SUPERVISORD_BIN" ]]; then
         HAS_SUPERVISOR=true
@@ -47,15 +47,40 @@ for arg in "$@"; do
     fi
 done
 
+# Build uvicorn command with host/port from args or defaults
+UVICORN_HOST="0.0.0.0"
+UVICORN_PORT=8000
+for ((i=0; i<${#EXTRA_ARGS[@]}; i++)); do
+    case "${EXTRA_ARGS[$i]}" in
+        --host)  UVICORN_HOST="${EXTRA_ARGS[$((i+1))]}"; ((i++)) ;;
+        --port)  UVICORN_PORT="${EXTRA_ARGS[$((i+1))]}"; ((i++)) ;;
+    esac
+done
+
 if $HAS_SUPERVISOR && ! $FORCE_SUPERVISOR; then
     # ── Supervisor mode (auto-restart) ────────────────────────────────
     echo "[supervisor] Starting under supervisord with auto-restart..."
 
-    # Generate config with actual paths
     CONF="$SERVICE_DIR/supervisord.generated.conf"
-    sed -e "s|__PYTHON__|$PYTHON|" \
-        -e "s|__DIR__|$SERVICE_DIR|" \
-        "$SERVICE_DIR/supervisord.conf" > "$CONF"
+    cat > "$CONF" <<EOF
+[supervisord]
+nodaemon=true
+logfile=/dev/null
+logfile_maxbytes=0
+pidfile=/tmp/supervisord.pid
+
+[program:home-battery-optimizer]
+command=$UVICORN rest_service:asgi_app --host $UVICORN_HOST --port $UVICORN_PORT
+directory=$SERVICE_DIR
+autostart=true
+autorestart=true
+startsecs=3
+startretries=5
+stopwaitsecs=10
+redirect_stderr=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+EOF
 
     exec "$SUPERVISORD_BIN" -c "$CONF"
 elif $FORCE_SUPERVISOR && ! $HAS_SUPERVISOR; then
@@ -64,8 +89,8 @@ elif $FORCE_SUPERVISOR && ! $HAS_SUPERVISOR; then
     exit 1
 else
     # ── Direct mode (no persistence) ──────────────────────────────────
-    echo "[direct] Starting without supervisor (no auto-restart)." >&2
+    echo "[direct] Starting via uvicorn (no auto-restart)." >&2
     echo "         Install supervisor for automatic restart on crash:" >&2
     echo "           pip install supervisor" >&2
-    exec "$PYTHON" rest_service.py "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+    exec "$UVICORN" rest_service:asgi_app --host "$UVICORN_HOST" --port "$UVICORN_PORT"
 fi

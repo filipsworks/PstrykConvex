@@ -4,10 +4,10 @@
 Accepts all CLI arguments as query parameters and returns JSON-only output.
 
 Usage:
-    uvicorn rest_service:app --host 0.0.0.0 --port 8000
+    uvicorn rest_service:asgi_app --host 0.0.0.0 --port 8000
 
-Or with Python directly (uses Flask):
-    python rest_service.py
+Or with Python directly (uses Flask dev server):
+    python rest_service.py [--host 0.0.0.0] [--port 8000] [--debug]
 
 Endpoints:
     GET /optimize   — Run optimization for a single day
@@ -357,6 +357,13 @@ def sensitivity_endpoint():
 def health():
     """Health check endpoint."""
     return jsonify({"status": "ok"})
+
+
+# ── ASGI wrapper for uvicorn (Flask is WSGI, uvicorn expects ASGI) ────────
+
+from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+
+asgi_app = WSGIMiddleware(app)
 
 
 if __name__ == "__main__":
