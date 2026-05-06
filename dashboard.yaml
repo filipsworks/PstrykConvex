@@ -1,0 +1,376 @@
+title: Optymalizacja Energii
+views:
+  - title: SOC
+    path: soc
+    type: panel
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: horizontal-stack
+            cards:
+              - type: custom:button-card
+                styles:
+                  card:
+                    - padding: 0px
+                  grid:
+                    - display: block
+                custom_fields:
+                  chart:
+                    card:
+                      type: custom:apexcharts-card
+                      header:
+                        show: true
+                        title: Przebieg dzisiejszej optymalizacji
+                      graph_span: 95m
+                      span:
+                        start: day
+                      series:
+                        - entity: sensor.soc_optimization_today
+                          name: Delta PLN
+                          type: column
+                          yaxis_id: delta
+                          color: '#22a7f0'
+                          data_generator: |
+                            return entity.attributes.points.map((point) => {
+                              return [new Date().setHours(0,0,0,0) + (point.target_soc * 60000), point.delta_cost_pln];
+                            });
+                        - entity: sensor.soc_optimization_today
+                          name: PLN / kWh
+                          type: line
+                          yaxis_id: price
+                          color: '#e74c3c'
+                          stroke_width: 3
+                          data_generator: |
+                            return entity.attributes.points.map((point) => {
+                              return [new Date().setHours(0,0,0,0) + (point.target_soc * 60000), point.cost_per_kwh];
+                            });
+                      yaxis:
+                        - id: delta
+                          apex_config:
+                            forceNiceScale: true
+                            labels:
+                              formatter: >
+                                EVAL:function(value) { return value.toFixed(4);
+                                }
+                            title:
+                              text: Delta PLN
+                        - id: price
+                          opposite: true
+                          apex_config:
+                            forceNiceScale: true
+                            labels:
+                              formatter: >
+                                EVAL:function(value) { return value.toFixed(6);
+                                }
+                            title:
+                              text: PLN/kWh
+                      apex_config:
+                        annotations:
+                          position: back
+                          yaxis:
+                            - 'y': >
+                                [[[ return
+                                states['sensor.soc_optimization_today'].attributes.baseline.cost_pln
+                                ]]]
+                              borderColor: '#00E396'
+                              label:
+                                style:
+                                  color: '#fff'
+                                  background: '#00E396'
+                                text: >
+                                  [[[ return 'Baseline: ' +
+                                  states['sensor.soc_optimization_today'].attributes.baseline.cost_pln
+                                  + ' PLN' ]]]
+                          xaxis:
+                            - x: |
+                                [[[
+                                  const baseSoc = states['sensor.soc_optimization_today'].attributes.baseline.final_soc_pct;
+                                  return new Date().setHours(0,0,0,0) + (baseSoc * 60000);
+                                ]]]
+                              borderColor: '#feb019'
+                              label:
+                                style:
+                                  color: '#fff'
+                                  background: '#feb019'
+                                text: >
+                                  [[[ return 'Base SOC: ' +
+                                  states['sensor.soc_optimization_today'].attributes.baseline.final_soc_pct
+                                  + '%' ]]]
+                        xaxis:
+                          type: datetime
+                          labels:
+                            formatter: |
+                              EVAL:function(val) {
+                                const diff = (val - new Date().setHours(0,0,0,0)) / 60000;
+                                return Math.round(diff) + '%';
+                              }
+                          tickAmount: 10
+                        chart:
+                          height: 450
+                        tooltip:
+                          shared: true
+                          x:
+                            format: ' '
+                          'y':
+                            formatter: |
+                              EVAL:function(value) {
+                                return value !== undefined ? value+ " " : undefined;
+                              }
+              - type: custom:button-card
+                styles:
+                  card:
+                    - padding: 0px
+                  grid:
+                    - display: block
+                custom_fields:
+                  chart:
+                    card:
+                      type: custom:apexcharts-card
+                      header:
+                        show: true
+                        title: Przebieg jutrzejszej optymalizacji
+                      graph_span: 95m
+                      span:
+                        start: day
+                      series:
+                        - entity: sensor.soc_optimization_tomorrow
+                          name: Delta PLN
+                          type: column
+                          yaxis_id: delta
+                          color: '#22a7f0'
+                          data_generator: |
+                            return entity.attributes.points.map((point) => {
+                              return [new Date().setHours(0,0,0,0) + (point.target_soc * 60000), point.delta_cost_pln];
+                            });
+                        - entity: sensor.soc_optimization_tomorrow
+                          name: PLN / kWh
+                          type: line
+                          yaxis_id: price
+                          color: '#e74c3c'
+                          stroke_width: 3
+                          data_generator: |
+                            return entity.attributes.points.map((point) => {
+                              return [new Date().setHours(0,0,0,0) + (point.target_soc * 60000), point.cost_per_kwh];
+                            });
+                      yaxis:
+                        - id: delta
+                          apex_config:
+                            forceNiceScale: true
+                            labels:
+                              formatter: >
+                                EVAL:function(value) { return value.toFixed(4);
+                                }
+                            title:
+                              text: Delta PLN
+                        - id: price
+                          opposite: true
+                          apex_config:
+                            forceNiceScale: true
+                            labels:
+                              formatter: >
+                                EVAL:function(value) { return value.toFixed(6);
+                                }
+                            title:
+                              text: PLN/kWh
+                      apex_config:
+                        annotations:
+                          position: back
+                          yaxis:
+                            - 'y': >
+                                [[[ return
+                                states['sensor.soc_optimization_tomorrow'].attributes.baseline.cost_pln
+                                ]]]
+                              borderColor: '#00E396'
+                              label:
+                                style:
+                                  color: '#fff'
+                                  background: '#00E396'
+                                text: >
+                                  [[[ return 'Baseline: ' +
+                                  states['sensor.soc_optimization_tomorrow'].attributes.baseline.cost_pln
+                                  + ' PLN' ]]]
+                          xaxis:
+                            - x: |
+                                [[[
+                                  const baseSoc = states['sensor.soc_optimization_tomorrow'].attributes.baseline.final_soc_pct;
+                                  return new Date().setHours(0,0,0,0) + (baseSoc * 60000);
+                                ]]]
+                              borderColor: '#feb019'
+                              label:
+                                style:
+                                  color: '#fff'
+                                  background: '#feb019'
+                                text: >
+                                  [[[ return 'Base SOC: ' +
+                                  states['sensor.soc_optimization_tomorrow'].attributes.baseline.final_soc_pct
+                                  + '%' ]]]
+                        xaxis:
+                          type: datetime
+                          labels:
+                            formatter: |
+                              EVAL:function(val) {
+                                const diff = (val - new Date().setHours(0,0,0,0)) / 60000;
+                                return Math.round(diff) + '%';
+                              }
+                          tickAmount: 10
+                        chart:
+                          height: 450
+                        tooltip:
+                          shared: true
+                          x:
+                            format: ' '
+                          'y':
+                            formatter: |
+                              EVAL:function(value) {
+                                return value !== undefined ? value+ " " : undefined;
+                              }
+          - type: horizontal-stack
+            cards:
+              - type: entities
+                entities:
+                  - entity: input_number.soc_target_today
+                    icon: mdi:content-save-cog-outline
+                    tap_action:
+                      action: call-service
+                      service: homeassistant.update_entity
+                      target:
+                        entity_id: sensor.optimizer_decisions_today
+                    name: SOC Docelowy - Dziś
+              - show_name: false
+                show_icon: true
+                type: button
+                icon: mdi:battery-sync
+                tap_action:
+                  action: perform-action
+                  perform_action: homeassistant.update_entity
+                  data:
+                    entity_id:
+                      - sensor.soc_optimization_today
+                      - sensor.soc_optimization_tomorrow
+                name: Odśwież SOC
+                color: green
+                icon_height: 50px
+              - type: entities
+                entities:
+                  - entity: input_number.soc_target_tomorrow
+                    name: SOC Docelowy - Jutro
+                    icon: mdi:content-save-cog-outline
+                    tap_action:
+                      action: call-service
+                      service: homeassistant.update_entity
+                      target:
+                        entity_id: sensor.optimizer_decisions_tomorrow
+          - type: horizontal-stack
+            cards:
+              - type: custom:flex-table-card
+                title: Decyzje – Dziś
+                entities:
+                  include: sensor.optimizer_decisions_today
+                columns:
+                  - name: Hr
+                    data: decisions
+                    modify: x.hour
+                  - name: Mode
+                    data: decisions
+                    modify: |
+                      (x.output_mode == "SBU" && x.charger_mode == "OSO")
+                        ? '<span style="color:dodgerblue">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                        : (x.output_mode == "SUB" && x.charger_mode == "SNU")
+                          ? '<span style="color:limegreen">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                          : '<span style="color:gray">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                  - name: Price
+                    data: decisions
+                    modify: x.price_plkwh.toFixed(3)
+                  - name: Charge
+                    data: decisions
+                    modify: |
+                      (x.charge_kwh > 0)
+                        ? "+" + x.charge_kwh.toFixed(2) + " kWh @ " + x.charge_amps + "A"
+                        : "—" + x.charge_kwh.toFixed(2) + " kWh"
+                  - name: SOC%
+                    data: decisions
+                    modify: x.soc_pct.toFixed(1) + "%"
+                  - name: Grid Cost
+                    data: decisions
+                    modify: x.grid_cost_pln.toFixed(4)
+                  - name: Total Cost
+                    data: decisions
+                    modify: x.total_cost_pln.toFixed(4)
+                  - name: Load
+                    data: decisions
+                    modify: |
+                      (x.output_mode == "SBU" && x.charger_mode == "OSO")
+                        ? '<span style="color:dodgerblue">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                        : (x.output_mode == "SUB" && x.charger_mode == "SNU")
+                          ? '<span style="color:limegreen">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                          : '<span style="color:gray">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                css:
+                  table+: |
+                    border-collapse: collapse;
+                  th:
+                    background-color: black;
+                    color: null
+                    font-weight: bold;
+                  td:
+                    background-color: black;
+                    color: null
+                    font-family: monospace;
+                  tr:nth-child(even) td:
+                    background-color: null
+                sort_by: Hr
+              - type: custom:flex-table-card
+                title: Decyzje – Jutro
+                entities:
+                  include: sensor.optimizer_decisions_tomorrow
+                columns:
+                  - name: Hr
+                    data: decisions
+                    modify: x.hour
+                  - name: Mode
+                    data: decisions
+                    modify: |
+                      (x.output_mode == "SBU" && x.charger_mode == "OSO")
+                        ? '<span style="color:dodgerblue">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                        : (x.output_mode == "SUB" && x.charger_mode == "SNU")
+                          ? '<span style="color:limegreen">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                          : '<span style="color:gray">' + x.output_mode + "/" + x.charger_mode + '</span>'
+                  - name: Price
+                    data: decisions
+                    modify: x.price_plkwh.toFixed(3)
+                  - name: Charge
+                    data: decisions
+                    modify: |
+                      (x.charge_kwh > 0)
+                        ? "+" + x.charge_kwh.toFixed(2) + " kWh @ " + x.charge_amps + "A"
+                        : "—" + x.charge_kwh.toFixed(2) + " kWh"
+                  - name: SOC%
+                    data: decisions
+                    modify: x.soc_pct.toFixed(1) + "%"
+                  - name: Grid Cost
+                    data: decisions
+                    modify: x.grid_cost_pln.toFixed(4)
+                  - name: Total Cost
+                    data: decisions
+                    modify: x.total_cost_pln.toFixed(4)
+                  - name: Load
+                    data: decisions
+                    modify: |
+                      (x.output_mode == "SBU" && x.charger_mode == "OSO")
+                        ? '<span style="color:dodgerblue">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                        : (x.output_mode == "SUB" && x.charger_mode == "SNU")
+                          ? '<span style="color:limegreen">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                          : '<span style="color:gray">' + "█".repeat(Math.round(Math.abs(x.charge_kwh) * 12.5)) + '</span>'
+                css:
+                  table+: |
+                    border-collapse: collapse;
+                  th:
+                    background-color: black;
+                    color: null
+                    font-weight: bold;
+                  td:
+                    background-color: black;
+                    color: null
+                    font-family: monospace;
+                  tr:nth-child(even) td:
+                    background-color: null
+                sort_by: Hr

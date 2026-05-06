@@ -22,6 +22,7 @@ def optimize(
     dummy_loads_kw: list[float],
     initial_soc: float,
     target_soc: float = None,
+    start_hour: int = 0,
 ) -> dict:
     """Run the CVXPY optimization and return results.
 
@@ -32,12 +33,14 @@ def optimize(
     Args:
         prices: 24 hourly price dicts with 'hour', 'price' keys.
         dummy_loads_kw: 24-hour dummy load profile in kW.
-        initial_soc: SOC at hour 0 (0–1).
+        initial_soc: SOC at start_hour (0–1). This should be the live battery SOC.
         target_soc: Optional target end-of-day SOC (0–1). If None, no constraint.
+        start_hour: The first hour to optimize (default 0 = full day).
+                    Hours before this are considered past and will not be optimized.
 
     Returns:
         dict with keys:
-          - decisions: list of 24 dicts, one per hour
+          - decisions: list of dicts for hours [start_hour, 24)
           - summary: daily totals
     """
     HOURS = 24
@@ -56,18 +59,35 @@ def optimize(
 
     soc = cp.Variable(HOURS + 1)  # SOC fraction at each hour boundary
 
-    # --- Objective: minimize total grid cost ---
+    # --- Objective: minimize total grid cost (only for future hours) ---
     price_array = np.array([p["price"] for p in prices])
-    objective = cp.Minimize(cp.sum(price_array @ (grid_load + charge)))
+    objective = cp.Minimize(
+        cp.sum(
+            price_array[start_hour:] @ (grid_load[start_hour:] + charge[start_hour:])
+        )
+    )
 
     # --- Constraints ---
     constraints = []
 
-    # Initial SOC
-    constraints.append(soc[0] == initial_soc)
+    # Initial SOC at start_hour
+    constraints.append(soc[start_hour] == initial_soc)
 
     for h in range(HOURS):
         dummy = dummy_loads_kw[h]
+
+        if h < start_hour:
+            # Past hours: no charging or discharging allowed (already happened)
+            constraints.append(charge[h] == 0)
+            constraints.append(discharge[h] == 0)
+            constraints.append(grid_load[h] == dummy)
+            # SOC must be continuous through past hours (no actual optimization)
+            energy_in_wh = 0  # no charge in the past
+            energy_out_wh = 0  # no discharge tracked for past
+            constraints.append(
+                soc[h + 1] == soc[h] + (energy_in_wh - energy_out_wh) / capacity_wh
+            )
+            continue
 
         # Load satisfaction: grid supply + battery discharge (inverted) = dummy load demand
         constraints.append(grid_load[h] + eta_inv * discharge[h] == dummy)
@@ -120,14 +140,14 @@ def optimize(
         best_step = min(CHARGE_STEPS_A, key=lambda s: abs(s - current_a))
         return best_step * NOMINAL_VOLTAGE / 1000, best_step
 
-    # --- Build results ---
+    # --- Build results (only for optimized hours) ---
     decisions = []
     total_charge_wh = 0.0
     total_discharge_wh = 0.0
     total_grid_kwh = 0.0
     total_cost_pln = 0.0
 
-    for h in range(HOURS):
+    for h in range(start_hour, HOURS):
         ch_val = float(charge[h].value) if charge[h].value is not None else 0.0
         dis_val = float(discharge[h].value) if discharge[h].value is not None else 0.0
         gl_val = float(grid_load[h].value) if grid_load[h].value is not None else 0.0

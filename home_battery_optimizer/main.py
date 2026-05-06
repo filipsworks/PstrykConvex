@@ -2,11 +2,20 @@
 """Home battery charging optimizer — CLI entry point with TUI / JSON output."""
 
 import json
+from datetime import datetime, timezone
 
 import click
 from api import fetch_all_data
 from battery_model import voltage_to_soc
 from optimizer import optimize
+
+try:
+    from zoneinfo import ZoneInfo
+
+    WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+except ImportError:
+    # Fallback for Python < 3.9
+    WARSAW_TZ = timezone.utc
 
 # ── Mock data (used when --mock or API unavailable) ────────────────────────
 
@@ -166,16 +175,30 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
             err=True,
         )
 
+    # Calculate current hour in Europe/Warsaw timezone for live runs.
+    # The optimizer cannot make decisions for past hours.
+    if args.mock:
+        start_hour = 0
+    else:
+        now_warsaw = datetime.now(WARSAW_TZ)
+        start_hour = now_warsaw.hour
+        click.echo(
+            f"  Current time (Warsaw): {now_warsaw.strftime('%H:%M')} → "
+            f"optimizing from hour {start_hour} onwards",
+            err=True,
+        )
+
     # Run optimization for each day in the horizon
     all_results = []
-    n_days = (
-        1
-        if args.horizon == "today"
-        else (2 if args.horizon == "tomorrow" else len(prices) // 24 + 1)
-    )
-    # Actually, prices is always 24h. For multi-day we'd need more data.
-    # For now, optimize one day at a time from the price list.
-    for i in range(min(n_days, len(prices) // 24)):
+    n_days = len(prices) // 24
+    if args.horizon == "today":
+        n_days = 1
+    elif args.horizon == "tomorrow" and n_days >= 2:
+        # Skip today, only optimize tomorrow
+        prices = prices[24:]
+        n_days = 1
+
+    for i in range(n_days):
         start = i * 24
         end = min(start + 24, len(prices))
         if start >= end:
@@ -187,7 +210,7 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
         soc_start = (
             initial_soc
             if i == 0
-            else all_results[-1]["summary"]["final_soc"]
+            else all_results[-1]["summary"]["final_soc"] / 100.0
             if all_results
             else initial_soc
         )
@@ -195,9 +218,16 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
         # Convert target SOC from percent to fraction (0–1)
         target_soc_val = args.target_soc / 100 if args.target_soc is not None else None
 
+        # For the first day, skip past hours; for subsequent days optimize full day
+        day_start_hour = start_hour if i == 0 else 0
+
         try:
             result = optimize(
-                day_prices, day_loads, soc_start, target_soc=target_soc_val
+                day_prices,
+                day_loads,
+                soc_start,
+                target_soc=target_soc_val,
+                start_hour=day_start_hour,
             )
         except Exception as e:
             click.echo(f"[error] Optimization failed for day {i + 1}: {e}", err=True)

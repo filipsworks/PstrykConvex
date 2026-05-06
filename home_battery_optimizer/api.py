@@ -19,81 +19,100 @@ def fetch_hourly_prices(
         base_url: HA API base URL (e.g. https://ha-finland.kompfix.pl/api).
         token: Long-lived access token.
         horizon: 'today', 'tomorrow', or 'available'.
-                 'available' tries today first, falls back to tomorrow.
+                 'available' returns today + tomorrow if both are available,
+                 otherwise just the day that has data.
 
     Returns:
-        List of 24 dicts with keys: hour, price (PLN/kWh), is_cheap, is_expensive.
+        List of 24 or 48 dicts with keys: hour, price (PLN/kWh), is_cheap,
+        is_expensive, and optionally is_estimated.
     """
-    # Try the "today" sensor first
-    url = f"{base_url}/states/sensor.pstryk_aio_obecna_cena_zakupu_pradu"
-    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
 
-    prices_attr = data.get("attributes", {})
-    is_estimated = False  # default: not estimated
+    def _parse_price_list(raw_prices, is_estimated):
+        result = []
+        for p in raw_prices:
+            start_dt = datetime.fromisoformat(p["start"])
+            hour = start_dt.hour
+            entry = {
+                "hour": hour,
+                "price": float(p["price"]),
+                "is_cheap": bool(p.get("is_cheap", False)),
+                "is_expensive": bool(p.get("is_expensive", False)),
+            }
+            if is_estimated:
+                entry["is_estimated"] = True
+            result.append(entry)
+
+        result.sort(key=lambda x: x["hour"])
+        avg_price = sum(p["price"] for p in result) / len(result) if result else 1.0
+
+        full = [None] * 24
+        for p in result:
+            full[p["hour"]] = p
+        for h in range(24):
+            if full[h] is None:
+                full[h] = {
+                    "hour": h,
+                    "price": avg_price,
+                    "is_cheap": False,
+                    "is_expensive": False,
+                }
+
+        return full, is_estimated
+
+    def _fetch_from_main(attr_key):
+        try:
+            url = f"{base_url}/states/sensor.pstryk_aio_obecna_cena_zakupu_pradu"
+            resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_prices = data.get("attributes", {}).get(attr_key, [])
+            return _parse_price_list(raw_prices, is_estimated=False)
+        except Exception:
+            return [], True
+
+    def _fetch_tomorrow_sensor():
+        try:
+            url = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
+            resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_prices = data.get("attributes", {}).get("tomorrow_prices", [])
+            if raw_prices:
+                return _parse_price_list(raw_prices, is_estimated=False)
+        except Exception:
+            pass
+        return [], True
 
     if horizon == "today":
-        raw_prices = prices_attr.get("today_prices", [])
+        prices, _ = _fetch_from_main("today_prices")
+        return prices
+
     elif horizon == "tomorrow":
-        is_estimated = False
-        raw_prices = prices_attr.get("tomorrow_prices", [])
-        # If today's sensor doesn't have tomorrow_prices, try the dedicated sensor
-        if not raw_prices:
-            url2 = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
-            resp2 = requests.get(
-                url2, headers=_get_headers(base_url, token), timeout=15
-            )
-            resp2.raise_for_status()
-            data2 = resp2.json()
-            raw_prices = data2.get("attributes", {}).get("tomorrow_prices", [])
+        prices, _ = _fetch_tomorrow_sensor()
+        if not prices:
+            # Fallback: clone today's prices as estimation
+            today_prices, _ = _fetch_from_main("today_prices")
+            for p in today_prices:
+                p["is_estimated"] = True
+            return today_prices
+        return prices
 
-        # If still no tomorrow data, clone today's prices as estimation fallback
-        if not raw_prices:
-            is_estimated = True
-            raw_prices = prices_attr.get("today_prices", [])
-    else:  # "available"
-        raw_prices = prices_attr.get("today_prices", [])
-        if not raw_prices:
-            url2 = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
-            resp2 = requests.get(
-                url2, headers=_get_headers(base_url, token), timeout=15
-            )
-            resp2.raise_for_status()
-            data2 = resp2.json()
-            raw_prices = data2.get("attributes", {}).get("tomorrow_prices", [])
+    else:  # "available" — try to get both today and tomorrow
+        today_prices, _ = _fetch_from_main("today_prices")
+        if not today_prices:
+            # No today data — try tomorrow only
+            tomorrow_prices, _ = _fetch_tomorrow_sensor()
+            for p in tomorrow_prices:
+                p["is_estimated"] = True
+            return tomorrow_prices
 
-    result = []
-    for p in raw_prices:
-        start_dt = datetime.fromisoformat(p["start"])
-        hour = start_dt.hour
-        entry = {
-            "hour": hour,
-            "price": float(p["price"]),
-            "is_cheap": bool(p.get("is_cheap", False)),
-            "is_expensive": bool(p.get("is_expensive", False)),
-        }
-        if is_estimated:
-            entry["is_estimated"] = True
-        result.append(entry)
+        tomorrow_prices, _ = _fetch_tomorrow_sensor()
+        if not tomorrow_prices:
+            # No tomorrow data — just return today
+            return today_prices
 
-    # Sort by hour and fill any missing hours with average
-    result.sort(key=lambda x: x["hour"])
-    avg_price = sum(p["price"] for p in result) / len(result) if result else 1.0
-
-    full = [None] * 24
-    for p in result:
-        full[p["hour"]] = p
-    for h in range(24):
-        if full[h] is None:
-            full[h] = {
-                "hour": h,
-                "price": avg_price,
-                "is_cheap": False,
-                "is_expensive": False,
-            }
-
-    return full
+        # Both available — concatenate (today + tomorrow)
+        return today_prices + tomorrow_prices
 
 
 def fetch_battery_voltage(base_url: str, token: str) -> Optional[float]:
