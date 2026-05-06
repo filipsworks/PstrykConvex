@@ -364,8 +364,9 @@ def optimize_endpoint():
         mock, ha_url, ha_token, horizon, days
     )
 
-    # Calculate start_hour: skip past hours for live runs
-    if mock:
+    # Calculate start_hour: skip past hours for live runs.
+    # Only "today" has past hours; "tomorrow"/"available" are fully future.
+    if mock or horizon != "today":
         start_hour = 0
     else:
         now_warsaw = datetime.now(WARSAW_TZ)
@@ -446,8 +447,9 @@ def sensitivity_endpoint():
         mock, ha_url, ha_token, horizon, days
     )
 
-    # Calculate start_hour: skip past hours for live runs
-    if mock:
+    # Calculate start_hour: skip past hours for live runs.
+    # Only "today" has past hours; "tomorrow"/"available" are fully future.
+    if mock or horizon != "today":
         start_hour = 0
     else:
         now_warsaw = datetime.now(WARSAW_TZ)

@@ -177,9 +177,10 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
 
     # Calculate current hour in Europe/Warsaw timezone for live runs.
     # The optimizer cannot make decisions for past hours.
+    # Only "today" has past hours; "tomorrow"/"available" are fully future.
     if args.mock:
         start_hour = 0
-    else:
+    elif args.horizon == "today":
         now_warsaw = datetime.now(WARSAW_TZ)
         start_hour = now_warsaw.hour
         click.echo(
@@ -187,6 +188,9 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
             f"optimizing from hour {start_hour} onwards",
             err=True,
         )
+    else:
+        # Tomorrow or available — all hours are in the future
+        start_hour = 0
 
     # Run optimization for each day in the horizon
     all_results = []
