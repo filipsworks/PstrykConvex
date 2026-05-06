@@ -186,7 +186,7 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
     """Fetch recent dummy load readings (kW) from inverter output power.
 
     Returns a list of 24 estimated kW values based on median of recent readings,
-    with time-of-day pattern variation.
+    grouped by actual hour-of-day to capture real usage patterns.
 
     Args:
         base_url: HA API base URL.
@@ -208,7 +208,11 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
         return [1.5] * 24  # fallback
 
     data = resp.json()
-    readings = []
+
+    # Group readings by hour-of-day (UTC). Each entry has a "last_changed" ISO timestamp.
+    hourly_readings: dict[int, list[float]] = {h: [] for h in range(24)}
+    all_values: list[float] = []
+
     for entity_data in data:
         if not isinstance(entity_data, list):
             continue
@@ -217,26 +221,39 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
             if state in ("unavailable", "unknown"):
                 continue
             try:
-                readings.append(float(state))
+                value = float(state)
             except (ValueError, TypeError):
                 continue
 
-    if not readings:
+            all_values.append(value)
+
+            # Extract hour from the timestamp
+            ts = entry.get("last_changed", "")
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                utc_hour = dt.hour
+                if 0 <= utc_hour < 24:
+                    hourly_readings[utc_hour].append(value)
+            except (ValueError, TypeError):
+                # If we can't parse the timestamp, skip hour grouping but keep value
+                pass
+
+    if not all_values:
         return [1.5] * 24
 
     import statistics
 
-    baseline = statistics.median(readings)
+    overall_median = statistics.median(all_values)
 
-    # Apply time-of-day pattern based on typical home usage
+    # Build 24h profile: use per-hour median where data exists, fallback to overall median
     loads = []
     for h in range(24):
-        if 6 <= h <= 8 or 17 <= h <= 20:
-            loads.append(baseline * 1.5)  # peak hours
-        elif 9 <= h <= 16:
-            loads.append(baseline * 1.2)  # daytime elevated
+        hour_readings = hourly_readings[h]
+        if hour_readings:
+            loads.append(round(statistics.median(hour_readings), 3))
         else:
-            loads.append(baseline)  # night baseline
+            # No data for this hour — use overall median as fallback
+            loads.append(round(overall_median, 3))
 
     return loads
 
