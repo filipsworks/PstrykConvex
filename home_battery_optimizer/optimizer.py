@@ -177,22 +177,14 @@ def optimize(
         # Cost: PLN/kWh × kW × 1h = PLN (use snapped value for accuracy)
         total_cost_pln += price_array[h] * (gl_val + ch_kw_snapped)
 
-        # Determine mode pair from solution values:
+        # Determine mode: CHARGING or DISCHARGING (no idle, no SUB/OSO combo)
         is_charging = charge_amps > 0
-        is_discharging = dis_val > 0.01 and gl_val < dummy_loads_kw[h] * 0.99
 
         if is_charging:
             output_mode = "SUB"
             charger_mode = "SNU"
-        elif is_discharging:
-            if gl_val > dummy_loads_kw[h] * 0.99:
-                output_mode = "SUB"
-                charger_mode = "OSO"
-            else:
-                output_mode = "SBU"
-                charger_mode = "OSO"
         else:
-            output_mode = "SUB"
+            output_mode = "SBU"
             charger_mode = "OSO"
 
         # Total active power cost: price × (dummy loads + charge from grid)
