@@ -18,11 +18,19 @@ Endpoints:
 import json
 import sys
 from contextlib import redirect_stderr
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
 # Ensure the package directory is on sys.path so imports work when run directly
 sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from zoneinfo import ZoneInfo
+
+    WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+except ImportError:
+    WARSAW_TZ = timezone
 
 from api import fetch_all_data  # noqa: E402
 from battery_model import voltage_to_soc  # noqa: E402
@@ -137,8 +145,19 @@ def _has_estimated_prices(prices):
     return any(p.get("is_estimated", False) for p in prices)
 
 
-def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None):
-    """Run optimization and return (result, warnings)."""
+def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_hour=0):
+    """Run optimization and return (result, warnings).
+
+    Args:
+        prices: 24-hour price list.
+        dummy_loads: 24-hour load profile.
+        initial_soc: SOC at start_hour (0–1).
+        target_soc: Target end-of-day SOC fraction (0–1), or None.
+        start_hour: First hour to optimize (past hours are skipped).
+
+    Returns:
+        (result_dict, warnings_list)
+    """
     warnings = []
 
     if _has_estimated_prices(prices):
@@ -146,7 +165,9 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None):
             "Tomorrow's pricing data unavailable — using today's prices as estimation"
         )
 
-    result = optimize(prices, dummy_loads, initial_soc, target_soc=target_soc)
+    result = optimize(
+        prices, dummy_loads, initial_soc, target_soc=target_soc, start_hour=start_hour
+    )
 
     # Inject charge_kwh (signed) into each decision
     for d in result["decisions"]:
@@ -158,7 +179,54 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None):
     return result, warnings
 
 
-def _run_sensitivity(prices, dummy_loads, initial_soc):
+def _run_multi_day_optimization(
+    prices, dummy_loads, initial_soc, target_soc=None, start_hour=0
+):
+    """Run optimization for multiple days (e.g. today + tomorrow).
+
+    Args:
+        prices: List of 24×n price dicts (today first, then tomorrow, etc.).
+        dummy_loads: Reusable 24-hour load profile.
+        initial_soc: SOC at the beginning of day 1 (0–1).
+        target_soc: Target end-of-day SOC fraction for each day, or None.
+        start_hour: First hour to optimize on day 1 (past hours skipped).
+
+    Returns:
+        List of result dicts with a 'day_label' key prepended.
+    """
+    all_results = []
+    n_days = len(prices) // 24
+    current_soc = initial_soc
+
+    for i in range(n_days):
+        start = i * 24
+        end = min(start + 24, len(prices))
+        if start >= end:
+            break
+
+        day_prices = prices[start:end]
+        # Pad dummy loads to match (should already be 24h)
+        day_loads = (dummy_loads * ((end - start) // len(dummy_loads) + 1))[start:end]
+
+        # First day skips past hours; subsequent days optimize full day
+        day_start_hour = start_hour if i == 0 else 0
+
+        try:
+            result, warnings = _run_optimization(
+                day_prices, day_loads, current_soc, target_soc, day_start_hour
+            )
+        except Exception as e:
+            raise RuntimeError(f"Optimization failed for day {i + 1}: {e}") from e
+
+        # Propagate SOC to next day
+        current_soc = result["summary"]["final_soc"] / 100.0
+
+        all_results.append(result)
+
+    return all_results
+
+
+def _run_sensitivity(prices, dummy_loads, initial_soc, start_hour=0):
     """Run sensitivity analysis: unconstrained baseline + target SOC sweep."""
     stderr_capture = StringIO()
 
@@ -166,7 +234,7 @@ def _run_sensitivity(prices, dummy_loads, initial_soc):
         # Baseline (no target SOC)
         try:
             baseline_result = optimize(
-                prices, dummy_loads, initial_soc, target_soc=None
+                prices, dummy_loads, initial_soc, target_soc=None, start_hour=start_hour
             )
             baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
             baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
@@ -189,7 +257,11 @@ def _run_sensitivity(prices, dummy_loads, initial_soc):
             target_soc = target_pct / 100.0
             try:
                 result = optimize(
-                    prices, dummy_loads, initial_soc, target_soc=target_soc
+                    prices,
+                    dummy_loads,
+                    initial_soc,
+                    target_soc=target_soc,
+                    start_hour=start_hour,
                 )
                 summary = result["summary"]
                 total_cost_pln = summary["total_cost_pln"]
@@ -292,22 +364,53 @@ def optimize_endpoint():
         mock, ha_url, ha_token, horizon, days
     )
 
-    # Run optimization
+    # Calculate start_hour: skip past hours for live runs
+    if mock:
+        start_hour = 0
+    else:
+        now_warsaw = datetime.now(WARSAW_TZ)
+        start_hour = now_warsaw.hour
+
+    # Run optimization (handles multi-day when horizon="available")
     try:
-        result, warnings = _run_optimization(
-            prices, dummy_loads, initial_soc, target_soc
+        all_results = _run_multi_day_optimization(
+            prices, dummy_loads, initial_soc, target_soc, start_hour
         )
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
 
-    response = {
-        "initial_soc_pct": round(initial_soc * 100, 1),
-        "horizon": horizon,
-        "warnings": warnings + stderr_log.strip().splitlines() if stderr_log else [],
-        **result,
-    }
+    # Build response with day labels
+    responses = []
+    for i, result in enumerate(all_results):
+        if len(all_results) == 1 and horizon != "available":
+            date_label = horizon.capitalize()
+        else:
+            date_label = f"Day {i + 1}"
 
-    return jsonify(response)
+        # Collect warnings from this day's optimization
+        day_warnings = []
+        if _has_estimated_prices(prices[i * 24 : min((i + 1) * 24, len(prices))]):
+            day_warnings.append(
+                "Tomorrow's pricing data unavailable — using today's prices as estimation"
+            )
+
+        responses.append(
+            {
+                "day_label": date_label,
+                "initial_soc_pct": round(result["decisions"][0]["soc_pct"], 1)
+                if result["decisions"]
+                else round(initial_soc * 100, 1),
+                **result,
+                "warnings": day_warnings + stderr_log.strip().splitlines()
+                if stderr_log
+                else [],
+            }
+        )
+
+    # Return single object or list depending on number of days
+    if len(responses) == 1:
+        return jsonify(responses[0])
+    return jsonify({"days": responses})
 
 
 @app.route("/sensitivity", methods=["GET"])
@@ -338,14 +441,23 @@ def sensitivity_endpoint():
     if horizon not in valid_horizons:
         return jsonify({"error": f"horizon must be one of: {valid_horizons}"}), 400
 
-    # Fetch data
+    # Fetch data (use first day's prices for sensitivity)
     prices, dummy_loads, initial_soc, stderr_log = _get_data(
         mock, ha_url, ha_token, horizon, days
     )
 
-    # Run sensitivity
+    # Calculate start_hour: skip past hours for live runs
+    if mock:
+        start_hour = 0
+    else:
+        now_warsaw = datetime.now(WARSAW_TZ)
+        start_hour = now_warsaw.hour
+
+    # Run sensitivity (uses first 24h of prices)
     try:
-        result, stderr_content = _run_sensitivity(prices, dummy_loads, initial_soc)
+        result, stderr_content = _run_sensitivity(
+            prices[:24], dummy_loads, initial_soc, start_hour=start_hour
+        )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500
 
