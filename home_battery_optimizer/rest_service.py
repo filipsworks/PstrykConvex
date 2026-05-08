@@ -34,7 +34,7 @@ except ImportError:
 
 from api import fetch_all_data  # noqa: E402
 from battery_model import voltage_to_soc  # noqa: E402
-from optimizer import optimize  # noqa: E402
+from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize  # noqa: E402
 
 # ── Mock data (fallback when API unavailable) ─────────────────────────────
 
@@ -145,7 +145,7 @@ def _has_estimated_prices(prices):
     return any(p.get("is_estimated", False) for p in prices)
 
 
-def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_hour=0):
+def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_hour=0, objective=OBJECTIVE_MIN_COST):
     """Run optimization and return (result, warnings).
 
     Args:
@@ -166,7 +166,8 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_h
         )
 
     result = optimize(
-        prices, dummy_loads, initial_soc, target_soc=target_soc, start_hour=start_hour
+        prices, dummy_loads, initial_soc, target_soc=target_soc,
+        start_hour=start_hour, objective=objective,
     )
 
     # Inject charge_kwh (signed) into each decision
@@ -180,7 +181,7 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_h
 
 
 def _run_multi_day_optimization(
-    prices, dummy_loads, initial_soc, target_soc=None, start_hour=0
+    prices, dummy_loads, initial_soc, target_soc=None, start_hour=0, objective=OBJECTIVE_MIN_COST
 ):
     """Run optimization for multiple days (e.g. today + tomorrow).
 
@@ -213,7 +214,7 @@ def _run_multi_day_optimization(
 
         try:
             result, warnings = _run_optimization(
-                day_prices, day_loads, current_soc, target_soc, day_start_hour
+                day_prices, day_loads, current_soc, target_soc, day_start_hour, objective
             )
         except Exception as e:
             raise RuntimeError(f"Optimization failed for day {i + 1}: {e}") from e
@@ -341,6 +342,10 @@ def optimize_endpoint():
     if horizon not in valid_horizons:
         return jsonify({"error": f"horizon must be one of: {valid_horizons}"}), 400
 
+    objective = request.args.get("objective", OBJECTIVE_MIN_COST)
+    if objective not in VALID_OBJECTIVES:
+        return jsonify({"error": f"objective must be one of: {list(VALID_OBJECTIVES)}"}), 400
+
     target_soc = None
     if target_soc_raw is not None:
         try:
@@ -375,7 +380,7 @@ def optimize_endpoint():
     # Run optimization (handles multi-day when horizon="available")
     try:
         all_results = _run_multi_day_optimization(
-            prices, dummy_loads, initial_soc, target_soc, start_hour
+            prices, dummy_loads, initial_soc, target_soc, start_hour, objective
         )
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
@@ -398,6 +403,7 @@ def optimize_endpoint():
         responses.append(
             {
                 "day_label": date_label,
+                "objective": objective,
                 "initial_soc_pct": round(result["decisions"][0]["soc_pct"], 1)
                 if result["decisions"]
                 else round(initial_soc * 100, 1),

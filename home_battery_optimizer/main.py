@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import click
 from api import fetch_all_data
 from battery_model import voltage_to_soc
-from optimizer import optimize
+from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize
 
 try:
     from zoneinfo import ZoneInfo
@@ -81,9 +81,8 @@ MOCK_DUMMY_LOADS = [
     context_settings={"max_content_width": 120},
     epilog=(
         "Mode legend:\n"
-        "  SUB/SNU — loads on grid + charge battery from grid (cheap hours)\n"
-        "  SBU/OSO — loads on battery, no charging (default)\n"
-        "  SUB/OSO — loads on grid, no charging (idle battery)"
+        "  SUB/SNU — charging battery from grid\n"
+        "  SBU/OSO — discharging battery to loads"
     ),
 )
 @click.option("--mock", is_flag=True, help="Use sample data instead of API")
@@ -127,8 +126,18 @@ MOCK_DUMMY_LOADS = [
     metavar="PCT",
     help="Target end-of-day SOC in percent (0–100). Default: no constraint.",
 )
+@click.option(
+    "--objective",
+    type=click.Choice(["min_cost", "min_cost_per_kwh"]),
+    default="min_cost",
+    show_default=True,
+    help=(
+        "Optimisation objective: 'min_cost' minimises total PLN spend; "
+        "'min_cost_per_kwh' minimises average PLN/kWh by sweeping EOD SOC targets."
+    ),
+)
 @click.pass_context
-def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
+def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objective):
     r"""Home battery charging optimizer.
 
     Examples:
@@ -162,6 +171,7 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
             "days": days,
             "output": output,
             "target_soc": target_soc,
+            "objective": objective,
         },
     )()
 
@@ -232,14 +242,16 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc):
                 soc_start,
                 target_soc=target_soc_val,
                 start_hour=day_start_hour,
+                objective=args.objective,
             )
         except Exception as e:
             click.echo(f"[error] Optimization failed for day {i + 1}: {e}", err=True)
             ctx.exit(1)
 
-        # Inject charge_kwh (signed) into each decision
+        # Inject charge_kwh (signed) and day into each decision
         for d in result["decisions"]:
             d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
+            d["day"] = i + 1
 
         # Propagate estimated pricing flag into results (for JSON output)
         if _has_estimated_prices(day_prices):
@@ -398,11 +410,7 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
             # Charge/discharge value with sign and amps (for charging)
             ch_kwh = d["charge_kwh"]  # positive = charge, negative = discharge
             charge_amps = d.get("charge_amps", 0)
-            if abs(ch_kwh) < 0.005:
-                charge_str = "    idle"
-                bar_str = "." * bar_width
-                color = "\033[90m"  # gray
-            elif ch_kwh > 0:
+            if ch_kwh > 0:
                 charge_str = f"+{ch_kwh:.2f} kWh @ {charge_amps}A"
                 blen = max(1, int(ch_kwh / max_abs * bar_width))
                 bar_str = "█" * blen + "." * (bar_width - blen)
@@ -438,6 +446,14 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
         lines.append(f"    Cycled:        {summary['cycled_pct']:>8.2f}% of capacity")
         lines.append(f"    Grid used:     {summary['total_grid_kwh']:>8.3f} kWh")
         lines.append(f"    Total cost:    {summary['total_cost_pln']:>8.4f} PLN")
+        grid_kwh = summary['total_grid_kwh']
+        if grid_kwh > 0:
+            lines.append(f"    Cost/kWh:      {summary['total_cost_pln'] / grid_kwh:>8.4f} PLN/kWh")
+        obj_label = result.get('objective', 'min_cost')
+        if obj_label == 'min_cost_per_kwh' and result.get('chosen_target_soc_pct') is not None:
+            lines.append(f"    Objective:     min_cost_per_kwh  (target SOC {result['chosen_target_soc_pct']:.0f}%,  {result['chosen_cost_per_kwh']:.4f} PLN/kWh)")
+        else:
+            lines.append(f"    Objective:     {obj_label}")
 
     # Legend (once at end)
     if all_results:
@@ -445,13 +461,10 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
         lines.append(sep)
         lines.append("  Mode legend:")
         lines.append(
-            "    SUB/SNU — loads on grid + charge battery from grid   [green bar]"
+            "    SUB/SNU — charging battery from grid              [green bar]"
         )
         lines.append(
-            "    SBU/OSO — loads on battery, no charging              [blue bar]"
-        )
-        lines.append(
-            "    SUB/OSO — loads on grid, no charging (idle battery)  [gray bar]"
+            "    SBU/OSO — discharging battery to loads             [blue bar]"
         )
         lines.append("")
 

@@ -76,6 +76,7 @@ Run the charging optimization and return JSON results.
 | `horizon` | enum | `available` | No | Which day's prices to optimize: `today`, `tomorrow`, or `available` |
 | `days` | integer | `1` | No | Number of days of history to fetch for load estimation |
 | `target_soc` | float | *(none)* | No | Target end-of-day SOC in percent (0–100). If omitted or `-1`, optimizer chooses freely. |
+| `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
 
 **Response:**
 
@@ -83,6 +84,7 @@ Run the charging optimization and return JSON results.
 {
   "initial_soc_pct": 35.0,
   "horizon": "available",
+  "objective": "min_cost",
   "warnings": [],
   "is_estimated": false,
   "decisions": [
@@ -132,6 +134,9 @@ curl "http://localhost:8000/optimize?ha_url=https://ha.example.com&ha_token=YOUR
 
 # Tomorrow's prices, last 3 days of history
 curl "http://localhost:8000/optimize?ha_url=https://ha.example.com&ha_token=YOUR_TOKEN&horizon=tomorrow&days=3"
+
+# Minimise PLN/kWh (cheapest energy rate, sweep-selected SOC)
+curl "http://localhost:8000/optimize?mock=true&objective=min_cost_per_kwh"
 ```
 
 ---

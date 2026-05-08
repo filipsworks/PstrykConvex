@@ -2,9 +2,11 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
+WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 def _get_headers(base_url: str, token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -231,9 +233,9 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
             ts = entry.get("last_changed", "")
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                utc_hour = dt.hour
-                if 0 <= utc_hour < 24:
-                    hourly_readings[utc_hour].append(value)
+                local_hour = dt.astimezone(WARSAW_TZ).hour
+                if 0 <= local_hour < 24:
+                    hourly_readings[local_hour].append(value)
             except (ValueError, TypeError):
                 # If we can't parse the timestamp, skip hour grouping but keep value
                 pass
