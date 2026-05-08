@@ -2,11 +2,16 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 import requests
 
-WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+try:
+    from zoneinfo import ZoneInfo
+
+    WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+except ImportError:
+    WARSAW_TZ = timezone.utc  # Python < 3.9 fallback
+
 
 def _get_headers(base_url: str, token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -211,7 +216,9 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
 
     data = resp.json()
 
-    # Group readings by hour-of-day (UTC). Each entry has a "last_changed" ISO timestamp.
+    # Group readings by hour-of-day (Warsaw local time).
+    # HA returns last_changed in UTC; prices are indexed by Warsaw hour,
+    # so we must convert before bucketing to avoid a 1-2 h misalignment.
     hourly_readings: dict[int, list[float]] = {h: [] for h in range(24)}
     all_values: list[float] = []
 
@@ -229,7 +236,7 @@ def fetch_dummy_loads(base_url: str, token: str, days: int = 1) -> list[float]:
 
             all_values.append(value)
 
-            # Extract hour from the timestamp
+            # Extract Warsaw local hour from the UTC timestamp
             ts = entry.get("last_changed", "")
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
