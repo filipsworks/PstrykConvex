@@ -2,12 +2,13 @@
 """Home battery charging optimizer — CLI entry point with TUI / JSON output."""
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import click
 from api import fetch_all_data
 from battery_model import voltage_to_soc
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize
+from overrides import OptimizerOverrides, build_overrides_from_query
 
 try:
     from zoneinfo import ZoneInfo
@@ -139,8 +140,35 @@ MOCK_DUMMY_LOADS = [
         "'min_cost_per_kwh' minimises average PLN/kWh by sweeping EOD SOC targets."
     ),
 )
+@click.option("--max-soc-pct", type=float, default=95.0, show_default=True,
+              help="Upper SOC bound in percent (GBB-style buffer; lower = more headroom).")
+@click.option("--min-soc-pct", type=float, default=10.0, show_default=True,
+              help="Lower SOC bound in percent (depth-of-discharge floor).")
+@click.option("--full-charge-days", default="", metavar="CSV",
+              help="Day-of-month CSV (e.g. '1,15') forced to MaxSOC=100% for a balance cycle.")
+@click.option("--per-date-target-soc", default="", metavar="LIST",
+              help="Per-date EOD SOC pins, 'YYYY-MM-DD:pct,YYYY-MM-DD:pct'.")
+@click.option("--consumption-scale", type=float, default=1.0, show_default=True,
+              help="Multiplier on the auto-learned consumption profile.")
+@click.option("--consumption-profile", default="", metavar="JSON",
+              help='Replacement weekday map, JSON: {"0": [24 kW], "1": [...], ...}.')
+@click.option("--load-override-kw", default="", metavar="CSV",
+              help="Hard replace net load: CSV of 24 (or 48) kW values.")
+@click.option("--extra-loads", default="", metavar="LIST",
+              help="One-shot loads, 'hour:kw[:duration_h],hour:kw' or JSON list.")
+@click.option("--solar-scale", type=float, default=1.0, show_default=True,
+              help="PV forecast correction factor (default 1.0).")
+@click.option("--solar-override-kwh", default="", metavar="CSV",
+              help="Replace PV forecast: CSV of 24 (or 48) kWh values.")
+@click.option("--dry-run", is_flag=True,
+              help="Test mode: decisions are advisory, not for inverter execution.")
 @click.pass_context
-def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objective):
+def main(
+    ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objective,
+    max_soc_pct, min_soc_pct, full_charge_days, per_date_target_soc,
+    consumption_scale, consumption_profile, load_override_kw, extra_loads,
+    solar_scale, solar_override_kwh, dry_run,
+):
     r"""Home battery charging optimizer.
 
     Examples:
@@ -162,6 +190,26 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
         )
         ctx.exit(1)
 
+    # Build overrides from CLI flags.  Using ``build_overrides_from_query``
+    # keeps CLI and REST behaviour identical.
+    try:
+        overrides = build_overrides_from_query({
+            "max_soc_pct": str(max_soc_pct),
+            "min_soc_pct": str(min_soc_pct),
+            "full_charge_days": full_charge_days,
+            "per_date_target_soc": per_date_target_soc,
+            "consumption_scale": str(consumption_scale),
+            "consumption_profile": consumption_profile,
+            "load_override_kw": load_override_kw,
+            "extra_loads": extra_loads,
+            "solar_scale": str(solar_scale),
+            "solar_override_kwh": solar_override_kwh,
+            "dry_run": "true" if dry_run else "false",
+        })
+    except ValueError as e:
+        click.echo(f"[error] Bad override: {e}", err=True)
+        ctx.exit(1)
+
     # Build a simple namespace-like object to keep get_data / downstream code unchanged
     args = type(
         "Args",
@@ -175,11 +223,12 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
             "output": output,
             "target_soc": target_soc,
             "objective": objective,
+            "overrides": overrides,
         },
     )()
 
-    # Fetch data
-    prices, dummy_loads, initial_soc = get_data(args)
+    # Fetch data (now thread overrides through to the API)
+    prices, dummy_loads, initial_soc, horizon_dates = get_data(args)
 
     # Warn if tomorrow's pricing is estimated (cloned from today)
     if _has_estimated_prices(prices):
@@ -217,6 +266,12 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
             dummy_loads = dummy_loads[24:]
         n_days = 1
 
+    # If we trimmed today out for `--horizon tomorrow`, also trim the date list
+    # so per-date overrides still line up with each day.
+    block_dates = list(horizon_dates) if horizon_dates else []
+    if args.horizon == "tomorrow" and len(block_dates) >= 2:
+        block_dates = block_dates[1:]
+
     for i in range(n_days):
         start = i * 24
         end = min(start + 24, len(prices))
@@ -238,8 +293,24 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
             else initial_soc
         )
 
-        # Convert target SOC from percent to fraction (0–1)
-        target_soc_val = args.target_soc / 100 if args.target_soc is not None else None
+        # Resolve per-day calendar date so MaxSOC scheduling + per-date target
+        # SOC pins from --full-charge-days / --per-date-target-soc apply.
+        day_obj = None
+        if i < len(block_dates):
+            try:
+                day_obj = date.fromisoformat(block_dates[i])
+            except (ValueError, TypeError):
+                day_obj = None
+
+        day_max_soc = (
+            overrides.max_soc_for_date(day_obj)
+            if day_obj is not None
+            else overrides.max_soc_pct / 100.0
+        )
+        day_min_soc = overrides.min_soc()
+        day_target_soc = overrides.target_soc_for_date(
+            day_obj, fallback_pct=args.target_soc
+        )
 
         # For the first day, skip past hours; for subsequent days optimize full day
         day_start_hour = start_hour if i == 0 else 0
@@ -249,9 +320,11 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
                 day_prices,
                 day_loads,
                 soc_start,
-                target_soc=target_soc_val,
+                target_soc=day_target_soc,
                 start_hour=day_start_hour,
                 objective=args.objective,
+                max_soc=day_max_soc,
+                min_soc=day_min_soc,
             )
         except Exception as e:
             click.echo(f"[error] Optimization failed for day {i + 1}: {e}", err=True)
@@ -266,16 +339,24 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
         if _has_estimated_prices(day_prices):
             result["is_estimated"] = True
 
+        # Annotate full-charge / advisory status so JSON consumers can branch on it.
+        result["is_full_charge_day"] = day_max_soc >= 0.999
+        result["advisory"] = overrides.dry_run
+        if day_obj is not None:
+            result["date"] = day_obj.isoformat()
+
         all_results.append(result)
 
     # Output
     if args.output == "json":
-        click.echo(render_json(all_results))
+        click.echo(render_json(all_results, overrides=overrides))
     elif args.output == "sensitivity":
         click.echo(render_sensitivity(prices, dummy_loads, initial_soc))
     elif args.output == "sensitivity-json":
         render_sensitivity_json(prices, dummy_loads, initial_soc)
     else:
+        if overrides.dry_run:
+            click.echo("[dry-run] Advisory output — do not push decisions to inverter.", err=True)
         click.echo(render_tui(all_results, horizon=args.horizon))
 
 
@@ -291,12 +372,36 @@ def _build_base_url(ha_url: str) -> str:
 
 
 def get_data(args):
-    """Return (prices, dummy_loads, initial_soc) for the requested horizon."""
+    """Return (prices, dummy_loads, initial_soc, horizon_dates) for the requested horizon.
+
+    ``args.overrides`` is forwarded to :func:`api.fetch_all_data` so the
+    returned ``dummy_loads`` already reflects consumption/solar overrides.
+    ``horizon_dates`` is a list of ISO date strings (one per 24-hour block) so
+    callers can resolve per-date overrides (full-charge days, target SOC pins).
+    """
+    overrides = getattr(args, "overrides", None)
+    horizon_dates: list[str] = []
+
     if args.mock:
         click.echo("[mock] Using sample data", err=True)
         prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
         dummy_loads = MOCK_DUMMY_LOADS
         initial_soc = 0.35
+        # Mock data is single-day; assign today's date for per-date overrides.
+        horizon_dates = [datetime.now(WARSAW_TZ).date().isoformat()]
+        # Apply override-driven scale + extras to mock loads so dry-runs work.
+        if overrides is not None:
+            scaled = [v * overrides.consumption_scale for v in dummy_loads]
+            for load in overrides.extra_loads:
+                base = load.get("day", 0) * 24
+                for off in range(load["duration_h"]):
+                    idx = base + load["hour"] + off
+                    if 0 <= idx < len(scaled):
+                        scaled[idx] += load["kw"]
+            if overrides.load_override_kw is not None:
+                for i in range(min(len(scaled), len(overrides.load_override_kw))):
+                    scaled[i] = max(0.0, overrides.load_override_kw[i])
+            dummy_loads = [round(v, 3) for v in scaled]
     else:
         base_url = _build_base_url(args.ha_url)
 
@@ -309,15 +414,18 @@ def get_data(args):
                 token=args.ha_token,
                 days=args.days,
                 horizon=args.horizon,
+                overrides=overrides,
             )
         except Exception as e:
             click.echo(f"[error] API failed ({e}), falling back to mock", err=True)
             prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
             dummy_loads = MOCK_DUMMY_LOADS
             initial_soc = 0.35
+            horizon_dates = [datetime.now(WARSAW_TZ).date().isoformat()]
         else:
             prices = data["prices"]
             dummy_loads = data["dummy_loads"]
+            horizon_dates = data.get("horizon_dates") or []
             voltage = data.get("voltage")
             if voltage is not None:
                 initial_soc = voltage_to_soc(voltage)
@@ -329,7 +437,7 @@ def get_data(args):
                 initial_soc = 0.5
                 click.echo("  No voltage reading — defaulting to SOC 50%", err=True)
 
-    return prices, dummy_loads, initial_soc
+    return prices, dummy_loads, initial_soc, horizon_dates
 
 
 def _has_estimated_prices(prices: list[dict]) -> bool:
@@ -483,9 +591,16 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
 # ── JSON rendering ─────────────────────────────────────────────────────────
 
 
-def render_json(all_results: list[dict]) -> str:
-    """Return results as pretty-printed JSON."""
-    return json.dumps(all_results, indent=2)
+def render_json(all_results: list[dict], overrides: OptimizerOverrides | None = None) -> str:
+    """Return results as pretty-printed JSON, with optional overrides summary."""
+    if overrides is None:
+        return json.dumps(all_results, indent=2)
+    payload = {
+        "advisory": overrides.dry_run,
+        "overrides_active": overrides.summary(),
+        "days": all_results,
+    }
+    return json.dumps(payload, indent=2)
 
 
 # ── Sensitivity analysis ───────────────────────────────────────────────────

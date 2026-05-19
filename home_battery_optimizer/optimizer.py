@@ -28,6 +28,8 @@ def _build_and_solve(
     initial_soc: float,
     target_soc: float = None,
     start_hour: int = 0,
+    max_soc: float = MAX_SOC,
+    min_soc: float = MIN_SOC,
 ) -> dict:
     """Core LP: minimize total grid cost subject to battery dynamics.
 
@@ -38,6 +40,11 @@ def _build_and_solve(
     Negative-price hours are hard-constrained: discharge is forbidden and
     charging is forced to maximum rate (the separate dummy-load circuit that
     earns arbitrage revenue is not modelled in dummy_loads_kw).
+
+    ``max_soc`` and ``min_soc`` are fractions (0–1).  They override the
+    module-level :data:`MAX_SOC` / :data:`MIN_SOC` defaults so the caller can
+    schedule e.g. monthly full-charge balance days (``max_soc=1.0``) without
+    touching the rest of the code.
     """
     HOURS = 24
     capacity_wh = TOTAL_CAPACITY_WH
@@ -97,8 +104,8 @@ def _build_and_solve(
         constraints.append(
             soc[h + 1] == soc[h] + (energy_in_wh - energy_out_wh) / capacity_wh
         )
-        constraints.append(soc[h + 1] >= MIN_SOC)
-        constraints.append(soc[h + 1] <= MAX_SOC)
+        constraints.append(soc[h + 1] >= min_soc)
+        constraints.append(soc[h + 1] <= max_soc)
 
     if target_soc is not None:
         constraints.append(soc[HOURS] >= target_soc)
@@ -196,6 +203,8 @@ def _find_min_cost_per_kwh_target_soc(
     initial_soc: float,
     start_hour: int = 0,
     step_pct: int = 5,
+    max_soc: float = MAX_SOC,
+    min_soc: float = MIN_SOC,
 ) -> tuple[float | None, float]:
     """Sweep target SOC levels and return the one with minimum PLN/kWh.
 
@@ -210,7 +219,7 @@ def _find_min_cost_per_kwh_target_soc(
     best_target_soc: float | None = None
     best_cost_per_kwh = float("inf")
 
-    soc_levels_pct = list(range(0, int(MAX_SOC * 100) + 1, step_pct))
+    soc_levels_pct = list(range(int(min_soc * 100), int(max_soc * 100) + 1, step_pct))
     print(
         f"  [min_cost_per_kwh] Sweeping {len(soc_levels_pct)} SOC targets "
         f"({soc_levels_pct[0]}%–{soc_levels_pct[-1]}%, step {step_pct}%)…",
@@ -224,6 +233,8 @@ def _find_min_cost_per_kwh_target_soc(
                 prices, dummy_loads_kw, initial_soc,
                 target_soc=target_frac,
                 start_hour=start_hour,
+                max_soc=max_soc,
+                min_soc=min_soc,
             )
             summary = result["summary"]
             grid_kwh = summary["total_grid_kwh"]
@@ -261,6 +272,8 @@ def optimize(
     target_soc: float = None,
     start_hour: int = 0,
     objective: str = OBJECTIVE_MIN_COST,
+    max_soc: float = MAX_SOC,
+    min_soc: float = MIN_SOC,
 ) -> dict:
     """Run the CVXPY optimisation and return results.
 
@@ -288,6 +301,9 @@ def optimize(
                     min_cost_per_kwh (the sweep determines it).
         start_hour: First hour to optimise (default 0 = full day).
         objective: 'min_cost' or 'min_cost_per_kwh'.
+        max_soc: Upper SOC bound (0–1). Pass 1.0 for a scheduled monthly
+                 balance / full-charge day. Defaults to :data:`MAX_SOC`.
+        min_soc: Lower SOC bound (0–1). Defaults to :data:`MIN_SOC`.
 
     Returns:
         dict with keys:
@@ -302,21 +318,32 @@ def optimize(
             f"Unknown objective '{objective}'. Valid: {VALID_OBJECTIVES}"
         )
 
+    if not (0.0 <= min_soc < max_soc <= 1.0):
+        raise ValueError(
+            f"Invalid SOC bounds: min_soc={min_soc}, max_soc={max_soc} "
+            "(require 0 ≤ min < max ≤ 1)."
+        )
+
     chosen_target_soc = target_soc
     chosen_cost_per_kwh = None
 
     if objective == OBJECTIVE_MIN_COST_PER_KWH:
         chosen_target_soc, chosen_cost_per_kwh = _find_min_cost_per_kwh_target_soc(
-            prices, dummy_loads_kw, initial_soc, start_hour=start_hour
+            prices, dummy_loads_kw, initial_soc, start_hour=start_hour,
+            max_soc=max_soc, min_soc=min_soc,
         )
 
     result = _build_and_solve(
         prices, dummy_loads_kw, initial_soc,
         target_soc=chosen_target_soc,
         start_hour=start_hour,
+        max_soc=max_soc,
+        min_soc=min_soc,
     )
 
     result["objective"] = objective
+    result["max_soc_pct"] = round(max_soc * 100, 1)
+    result["min_soc_pct"] = round(min_soc * 100, 1)
     if objective == OBJECTIVE_MIN_COST_PER_KWH:
         result["chosen_target_soc_pct"] = (
             round(chosen_target_soc * 100, 0) if chosen_target_soc is not None else None

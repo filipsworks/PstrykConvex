@@ -8,6 +8,8 @@ from typing import Optional
 
 import requests
 
+from overrides import OptimizerOverrides
+
 try:
     from zoneinfo import ZoneInfo
 
@@ -442,15 +444,35 @@ def _build_net_load(
     consumption: dict,
     solar: dict,
     horizon_dates: list[date],
+    overrides: Optional[OptimizerOverrides] = None,
 ) -> tuple[list[float], list[float], list[float]]:
     """Assemble per-horizon-hour (net_load, raw_consumption, solar) lists.
 
     Net load = max(0, consumption[weekday][hour] - solar[date][hour]).
 
+    When an :class:`OptimizerOverrides` is supplied, the following knobs are
+    applied IN ORDER so layering is predictable:
+
+      1. ``consumption_profile``  → replace the auto-learned weekday map.
+      2. ``consumption_scale``    → multiplier on the per-hour kW.
+      3. ``solar_override_kwh``   → full PV forecast replacement.
+      4. ``solar_scale``          → multiplier on the PV forecast.
+      5. (net = max(0, consumption − solar))
+      6. ``extra_loads``          → add planned one-shot loads (kW × duration_h)
+      7. ``load_override_kw``     → final hard replacement of the net load.
+
     Returns three parallel lists, each ``len(prices)`` long.
     """
     profiles: dict[int, list[float]] = consumption["profiles"]
     overall_hourly: list[float] = consumption["overall_hourly"]
+
+    if overrides is None:
+        overrides = OptimizerOverrides()
+
+    # (1) Profile replacement.
+    if overrides.consumption_profile is not None:
+        profiles = {wd: overrides.consumption_profile.get(wd, profiles.get(wd, overall_hourly))
+                    for wd in range(7)}
 
     net: list[float] = []
     raw: list[float] = []
@@ -467,6 +489,8 @@ def _build_net_load(
 
         wd = day.weekday()
         cons_kw = profiles.get(wd, overall_hourly)[hour]
+        # (2) Consumption scale.
+        cons_kw *= overrides.consumption_scale
 
         # Pick the right solar day. Block 0 = today's solar, block 1 = tomorrow's.
         if block_idx == 0:
@@ -476,12 +500,32 @@ def _build_net_load(
         else:
             sol_kwh = 0.0
 
-        # 1-hour buckets, so kWh ≈ kW for the purposes of subtraction.
+        # (3) Solar override per horizon hour.
+        if overrides.solar_override_kwh is not None and i < len(overrides.solar_override_kwh):
+            sol_kwh = overrides.solar_override_kwh[i]
+        # (4) Solar scale (correction factor).
+        sol_kwh *= overrides.solar_scale
+
+        # (5) 1-hour buckets, so kWh ≈ kW for the purposes of subtraction.
         net_kw = max(0.0, cons_kw - sol_kwh)
 
         raw.append(round(cons_kw, 3))
         sol.append(round(sol_kwh, 3))
         net.append(round(net_kw, 3))
+
+    # (6) Extra one-shot loads (additive).
+    for load in overrides.extra_loads:
+        day_idx = load.get("day", 0)
+        base = day_idx * 24
+        for offset in range(load["duration_h"]):
+            idx = base + load["hour"] + offset
+            if 0 <= idx < len(net):
+                net[idx] = round(net[idx] + load["kw"], 3)
+
+    # (7) Final hard load override (replaces net entirely, length-tolerant).
+    if overrides.load_override_kw is not None:
+        for i in range(min(len(net), len(overrides.load_override_kw))):
+            net[i] = round(max(0.0, overrides.load_override_kw[i]), 3)
 
     return net, raw, sol
 
@@ -490,7 +534,11 @@ def _build_net_load(
 
 
 def fetch_all_data(
-    base_url: str, token: str, days: int = 7, horizon: str = "available"
+    base_url: str,
+    token: str,
+    days: int = 7,
+    horizon: str = "available",
+    overrides: Optional[OptimizerOverrides] = None,
 ) -> dict:
     """Fetch everything the optimizer needs in one call.
 
@@ -500,6 +548,10 @@ def fetch_all_data(
         days: Days of history for the weekday × hour consumption profile
               (default 7 — ensures every weekday is represented at least once).
         horizon: 'today', 'tomorrow', or 'available'.
+        overrides: Optional :class:`OptimizerOverrides` applied to the
+                   consumption profile, PV forecast, and net load.  When
+                   omitted, default (no-op) overrides are used so callers
+                   that don't care keep working unchanged.
 
     Returns:
         dict with:
@@ -515,6 +567,9 @@ def fetch_all_data(
                               covering the horizon.
           - horizon_dates: dates assigned to each 24-hour block.
     """
+    if overrides is None:
+        overrides = OptimizerOverrides()
+
     prices = fetch_hourly_prices(base_url, token, horizon=horizon)
     voltage = fetch_battery_voltage(base_url, token)
     battery_hist = fetch_battery_history(base_url, token, days=days)
@@ -533,7 +588,7 @@ def fetch_all_data(
     ]
 
     net_load, raw_consumption, solar_per_hour = _build_net_load(
-        prices, consumption, solar, h_dates
+        prices, consumption, solar, h_dates, overrides=overrides
     )
 
     return {

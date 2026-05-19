@@ -18,9 +18,10 @@ Endpoints:
 import json
 import sys
 from contextlib import redirect_stderr
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
+from typing import Optional
 
 # Ensure the package directory is on sys.path so imports work when run directly
 sys.path.insert(0, str(Path(__file__).parent))
@@ -35,6 +36,7 @@ except ImportError:
 from api import fetch_all_data  # noqa: E402
 from battery_model import voltage_to_soc  # noqa: E402
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize  # noqa: E402
+from overrides import OptimizerOverrides, build_overrides_from_query  # noqa: E402
 
 # ── Mock data (fallback when API unavailable) ─────────────────────────────
 
@@ -103,7 +105,14 @@ def _build_base_url(ha_url: str) -> str:
     return url
 
 
-def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
+def _get_data(
+    mock: bool,
+    ha_url: str,
+    ha_token: str,
+    horizon: str,
+    days: int,
+    overrides: Optional[OptimizerOverrides] = None,
+):
     """Return (prices, dummy_loads, initial_soc, aux, stderr_log).
 
     ``aux`` carries the extra signals folded into the net load so callers can
@@ -112,6 +121,11 @@ def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
         - solar_forecast_kwh: per-hour kWh from sensor.dom_energy_production_*.
         - out_of_work_days: dates (within the horizon) that are Sat/Sun/PL holiday.
         - horizon_dates: calendar date assigned to each 24-hour price block.
+
+    ``overrides`` is forwarded to :func:`fetch_all_data` so the returned
+    ``dummy_loads`` already reflects scale factors, profile replacement,
+    extra loads, and solar correction.  Mock mode applies the same overrides
+    locally so behaviour stays consistent across runs.
     """
     stderr_capture = StringIO()
     aux: dict = {
@@ -124,8 +138,13 @@ def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
     if mock:
         with redirect_stderr(stderr_capture):
             prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
-            dummy_loads = MOCK_DUMMY_LOADS
+            dummy_loads = _apply_overrides_to_mock(MOCK_DUMMY_LOADS, overrides)
             initial_soc = 0.35
+            today = datetime.now(WARSAW_TZ).date()
+            aux["raw_consumption"] = list(MOCK_DUMMY_LOADS)
+            aux["solar_forecast_kwh"] = [0.0] * 24
+            aux["out_of_work_days"] = []
+            aux["horizon_dates"] = [today.isoformat()]
     else:
         base_url = _build_base_url(ha_url)
         with redirect_stderr(stderr_capture):
@@ -135,14 +154,20 @@ def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
                     token=ha_token,
                     days=days,
                     horizon=horizon,
+                    overrides=overrides,
                 )
             except Exception as e:
                 stderr_capture.write(
                     f"[error] API failed ({e}), falling back to mock\n"
                 )
                 prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
-                dummy_loads = MOCK_DUMMY_LOADS
+                dummy_loads = _apply_overrides_to_mock(MOCK_DUMMY_LOADS, overrides)
                 initial_soc = 0.35
+                today = datetime.now(WARSAW_TZ).date()
+                aux["raw_consumption"] = list(MOCK_DUMMY_LOADS)
+                aux["solar_forecast_kwh"] = [0.0] * 24
+                aux["out_of_work_days"] = []
+                aux["horizon_dates"] = [today.isoformat()]
             else:
                 prices = data["prices"]
                 dummy_loads = data["dummy_loads"]
@@ -159,11 +184,45 @@ def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
     return prices, dummy_loads, initial_soc, aux, stderr_capture.getvalue()
 
 
+def _apply_overrides_to_mock(
+    base_loads: list[float], overrides: Optional[OptimizerOverrides]
+) -> list[float]:
+    """Mock-mode mirror of the parts of :func:`api._build_net_load` that apply
+    to the net-load list (scale + extra loads + hard replacement).
+
+    Profile replacement and solar correction are no-ops in mock mode because
+    the mock data is already a fixed net-load vector.
+    """
+    if overrides is None:
+        return list(base_loads)
+    loads = [v * overrides.consumption_scale for v in base_loads]
+    for load in overrides.extra_loads:
+        day_idx = load.get("day", 0)
+        base = day_idx * 24
+        for offset in range(load["duration_h"]):
+            idx = base + load["hour"] + offset
+            if 0 <= idx < len(loads):
+                loads[idx] += load["kw"]
+    if overrides.load_override_kw is not None:
+        for i in range(min(len(loads), len(overrides.load_override_kw))):
+            loads[i] = max(0.0, overrides.load_override_kw[i])
+    return [round(v, 3) for v in loads]
+
+
 def _has_estimated_prices(prices):
     return any(p.get("is_estimated", False) for p in prices)
 
 
-def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_hour=0, objective=OBJECTIVE_MIN_COST):
+def _run_optimization(
+    prices,
+    dummy_loads,
+    initial_soc,
+    target_soc=None,
+    start_hour=0,
+    objective=OBJECTIVE_MIN_COST,
+    max_soc: float = 0.95,
+    min_soc: float = 0.10,
+):
     """Run optimization and return (result, warnings).
 
     Args:
@@ -172,6 +231,7 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_h
         initial_soc: SOC at start_hour (0–1).
         target_soc: Target end-of-day SOC fraction (0–1), or None.
         start_hour: First hour to optimize (past hours are skipped).
+        max_soc, min_soc: SOC bounds (fractions).
 
     Returns:
         (result_dict, warnings_list)
@@ -186,6 +246,7 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_h
     result = optimize(
         prices, dummy_loads, initial_soc, target_soc=target_soc,
         start_hour=start_hour, objective=objective,
+        max_soc=max_soc, min_soc=min_soc,
     )
 
     # Inject charge_kwh (signed) into each decision
@@ -199,20 +260,40 @@ def _run_optimization(prices, dummy_loads, initial_soc, target_soc=None, start_h
 
 
 def _run_multi_day_optimization(
-    prices, dummy_loads, initial_soc, target_soc=None, start_hour=0, objective=OBJECTIVE_MIN_COST
+    prices,
+    dummy_loads,
+    initial_soc,
+    target_soc=None,
+    start_hour=0,
+    objective=OBJECTIVE_MIN_COST,
+    horizon_dates: Optional[list[str]] = None,
+    overrides: Optional[OptimizerOverrides] = None,
 ):
     """Run optimization for multiple days (e.g. today + tomorrow).
+
+    Per-day knobs are resolved from ``overrides``:
+      * Full-charge days (day-of-month in ``overrides.full_charge_days``)
+        get ``max_soc=1.0``.
+      * ``overrides.per_date_target_soc`` pins the EOD SOC for matching
+        ISO-date keys; falls back to the global ``target_soc`` otherwise.
 
     Args:
         prices: List of 24×n price dicts (today first, then tomorrow, etc.).
         dummy_loads: Reusable 24-hour load profile.
         initial_soc: SOC at the beginning of day 1 (0–1).
-        target_soc: Target end-of-day SOC fraction for each day, or None.
+        target_soc: Global fallback EOD SOC fraction (0–1), or None.
         start_hour: First hour to optimize on day 1 (past hours skipped).
+        horizon_dates: ISO date strings aligned with each 24-hour block.
+                       Required for full-charge-days / per-date scheduling
+                       to take effect (silently skipped if missing).
+        overrides: Optional :class:`OptimizerOverrides`.
 
     Returns:
         List of result dicts with a 'day_label' key prepended.
     """
+    if overrides is None:
+        overrides = OptimizerOverrides()
+
     all_results = []
     n_days = len(prices) // 24
     current_soc = initial_soc
@@ -234,12 +315,41 @@ def _run_multi_day_optimization(
         # First day skips past hours; subsequent days optimize full day
         day_start_hour = start_hour if i == 0 else 0
 
+        # Resolve per-day MaxSOC (full-charge balance day?) and target SOC.
+        day_obj: Optional[date] = None
+        if horizon_dates and i < len(horizon_dates):
+            try:
+                day_obj = date.fromisoformat(horizon_dates[i])
+            except ValueError:
+                day_obj = None
+
+        day_max_soc = (
+            overrides.max_soc_for_date(day_obj)
+            if day_obj is not None
+            else overrides.max_soc_pct / 100.0
+        )
+        day_min_soc = overrides.min_soc()
+
+        # Per-date target SOC wins over the global one; if neither set, None.
+        day_target_soc = overrides.target_soc_for_date(
+            day_obj,
+            fallback_pct=target_soc * 100.0 if target_soc is not None else None,
+        )
+
         try:
             result, warnings = _run_optimization(
-                day_prices, day_loads, current_soc, target_soc, day_start_hour, objective
+                day_prices, day_loads, current_soc, day_target_soc,
+                day_start_hour, objective,
+                max_soc=day_max_soc, min_soc=day_min_soc,
             )
         except Exception as e:
             raise RuntimeError(f"Optimization failed for day {i + 1}: {e}") from e
+
+        # Annotate result with the per-day MaxSOC actually used (visible in
+        # the response so the dashboard can show "Balance day: full charge").
+        result["is_full_charge_day"] = day_max_soc >= 0.999
+        if day_target_soc is not None:
+            result["effective_target_soc_pct"] = round(day_target_soc * 100, 1)
 
         # Propagate SOC to next day
         current_soc = result["summary"]["final_soc"] / 100.0
@@ -249,15 +359,24 @@ def _run_multi_day_optimization(
     return all_results
 
 
-def _run_sensitivity(prices, dummy_loads, initial_soc, start_hour=0):
-    """Run sensitivity analysis: unconstrained baseline + target SOC sweep."""
+def _run_sensitivity(
+    prices, dummy_loads, initial_soc, start_hour=0,
+    max_soc: float = 0.95, min_soc: float = 0.10,
+):
+    """Run sensitivity analysis: unconstrained baseline + target SOC sweep.
+
+    The sweep range is clamped to ``[min_soc, max_soc]`` (in %), matching the
+    bounds enforced by the LP, so target levels outside the buffer are not
+    attempted.
+    """
     stderr_capture = StringIO()
 
     with redirect_stderr(stderr_capture):
         # Baseline (no target SOC)
         try:
             baseline_result = optimize(
-                prices, dummy_loads, initial_soc, target_soc=None, start_hour=start_hour
+                prices, dummy_loads, initial_soc, target_soc=None, start_hour=start_hour,
+                max_soc=max_soc, min_soc=min_soc,
             )
             baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
             baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
@@ -274,9 +393,11 @@ def _run_sensitivity(prices, dummy_loads, initial_soc, start_hour=0):
             baseline_cost_per_kwh = 0
             last_soc_pct = None
 
-        # Sensitivity points (0–100% SOC, step 5%)
+        # Sensitivity points across the [min_soc, max_soc] band, step 5%.
+        lo = int(round(min_soc * 100))
+        hi = int(round(max_soc * 100))
         points = []
-        for target_pct in range(0, 105, 5):
+        for target_pct in range(lo, hi + 1, 5):
             target_soc = target_pct / 100.0
             try:
                 result = optimize(
@@ -285,6 +406,8 @@ def _run_sensitivity(prices, dummy_loads, initial_soc, start_hour=0):
                     initial_soc,
                     target_soc=target_soc,
                     start_hour=start_hour,
+                    max_soc=max_soc,
+                    min_soc=min_soc,
                 )
                 summary = result["summary"]
                 total_cost_pln = summary["total_cost_pln"]
@@ -330,31 +453,69 @@ def _parse_bool(value):
     """Parse a query-string boolean."""
     if value is None:
         return None
-    return value.lower() in ("true", "1", "yes")
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("true", "1", "yes", "on")
 
 
-@app.route("/optimize", methods=["GET"])
+def _request_args() -> dict:
+    """Return a single flat mapping covering both GET query params and POST JSON body.
+
+    POST bodies are useful when overrides contain commas or JSON (e.g.
+    ``extra_loads`` or ``consumption_profile``) and would otherwise be
+    awkward to URL-encode.
+    """
+    merged: dict = {}
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            merged.update({k: v for k, v in body.items() if v is not None})
+    for k, v in request.args.items():
+        merged.setdefault(k, v)
+    return merged
+
+
+@app.route("/optimize", methods=["GET", "POST"])
 def optimize_endpoint():
     """Run optimization and return JSON results.
 
-    Query parameters:
+    Connection parameters:
         mock            — Use sample data (true/false, default: false)
         ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
-        ha_token        — HA long-lived access token (required unless --mock)
+        ha_token        — HA long-lived access token (required unless mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
-        days            — Days of history to fetch (default: 1)
-        target_soc      — Target end-of-day SOC in percent 0–100 (optional)
+        days            — Days of history to fetch (default: 7)
 
-    Example:
-        GET /optimize?mock=true
-        GET /optimize?ha_url=https://ha.example.com&ha_token=MY_TOKEN&horizon=tomorrow&target_soc=80
+    Solver knobs:
+        target_soc          — Global EOD SOC % (0–100) or -1/omitted for free.
+        objective           — 'min_cost' or 'min_cost_per_kwh'.
+
+    GBB-inspired overrides (all optional):
+        max_soc_pct         — MaxSOC buffer % (default 95, GBB recommends 90).
+        min_soc_pct         — MinSOC % (default 10, depth-of-discharge floor).
+        full_charge_days    — CSV day-of-month (e.g. "1,15") forced to 100% SOC.
+        per_date_target_soc — CSV/JSON of date→%, e.g. "2026-05-21:80".
+        consumption_scale   — Multiplier on the learned profile (e.g. 0.5 "away").
+        consumption_profile — JSON {weekday(0=Mon)..6: [24 kW]} replacement.
+        load_override_kw    — CSV of 24 (or 48) kW values: hard-replace net load.
+        extra_loads         — JSON list or "hour:kw[:duration_h]" CSV — additive.
+        solar_scale         — PV forecast correction factor (default 1.0).
+        solar_override_kwh  — CSV of kWh-per-hour values, replaces PV forecast.
+        dry_run             — true → response carries advisory=true; no semantic
+                              change to numbers, but the dashboard / caller can
+                              choose not to push the decisions to the inverter.
+
+    Examples:
+        GET  /optimize?mock=true&full_charge_days=1,15&max_soc_pct=90
+        POST /optimize  body={"mock":"true","extra_loads":"[{\"hour\":14,\"kw\":2}]"}
     """
-    mock = _parse_bool(request.args.get("mock")) or False
-    ha_url = request.args.get("ha_url", "https://ha.kompfix.pl")
-    ha_token = request.args.get("ha_token", "")
-    horizon = request.args.get("horizon", "available")
-    days = int(request.args.get("days", 7))
-    target_soc_raw = request.args.get("target_soc")
+    args = _request_args()
+    mock = _parse_bool(args.get("mock")) or False
+    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
+    ha_token = args.get("ha_token", "")
+    horizon = args.get("horizon", "available")
+    days = int(args.get("days", 7))
+    target_soc_raw = args.get("target_soc")
 
     # Validate
     if not mock and not ha_token:
@@ -364,7 +525,7 @@ def optimize_endpoint():
     if horizon not in valid_horizons:
         return jsonify({"error": f"horizon must be one of: {valid_horizons}"}), 400
 
-    objective = request.args.get("objective", OBJECTIVE_MIN_COST)
+    objective = args.get("objective", OBJECTIVE_MIN_COST)
     if objective not in VALID_OBJECTIVES:
         return jsonify({"error": f"objective must be one of: {list(VALID_OBJECTIVES)}"}), 400
 
@@ -386,9 +547,14 @@ def optimize_endpoint():
     if target_soc is not None and not (0 <= target_soc <= 1):
         return jsonify({"error": "target_soc must be between 0 and 100"}), 400
 
-    # Fetch data
+    try:
+        overrides = build_overrides_from_query(args)
+    except ValueError as e:
+        return jsonify({"error": f"Bad override: {e}"}), 400
+
+    # Fetch data with overrides applied to consumption/solar/net-load
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
-        mock, ha_url, ha_token, horizon, days
+        mock, ha_url, ha_token, horizon, days, overrides=overrides
     )
 
     # Calculate start_hour: skip past hours for live runs.
@@ -402,7 +568,9 @@ def optimize_endpoint():
     # Run optimization (handles multi-day when horizon="available")
     try:
         all_results = _run_multi_day_optimization(
-            prices, dummy_loads, initial_soc, target_soc, start_hour, objective
+            prices, dummy_loads, initial_soc, target_soc, start_hour, objective,
+            horizon_dates=aux.get("horizon_dates"),
+            overrides=overrides,
         )
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
@@ -446,34 +614,41 @@ def optimize_endpoint():
                 "warnings": day_warnings + stderr_log.strip().splitlines()
                 if stderr_log
                 else [],
+                "advisory": overrides.dry_run,
+                "overrides_active": overrides.summary(),
             }
         )
 
     # Return single object or list depending on number of days
     if len(responses) == 1:
         return jsonify(responses[0])
-    return jsonify({"days": responses})
+    return jsonify({"days": responses, "advisory": overrides.dry_run})
 
 
-@app.route("/sensitivity", methods=["GET"])
+@app.route("/sensitivity", methods=["GET", "POST"])
 def sensitivity_endpoint():
     """Run sensitivity analysis and return JSON.
 
-    Query parameters:
+    Accepts the same override knobs as ``/optimize`` (consumption_scale,
+    consumption_profile, extra_loads, solar_scale, solar_override_kwh,
+    load_override_kw, max_soc_pct, min_soc_pct, full_charge_days,
+    per_date_target_soc, dry_run).  Per-date / full-charge-day overrides
+    apply to the first horizon day's MaxSOC bound that the sweep itself
+    is clamped to.
+
+    Query parameters (subset of /optimize):
         mock            — Use sample data (true/false, default: false)
         ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
         ha_token        — HA long-lived access token (required unless --mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
-        days            — Days of history to fetch (default: 1)
-
-    Example:
-        GET /sensitivity?mock=true
+        days            — Days of history to fetch (default: 7)
     """
-    mock = _parse_bool(request.args.get("mock")) or False
-    ha_url = request.args.get("ha_url", "https://ha.kompfix.pl")
-    ha_token = request.args.get("ha_token", "")
-    horizon = request.args.get("horizon", "available")
-    days = int(request.args.get("days", 7))
+    args = _request_args()
+    mock = _parse_bool(args.get("mock")) or False
+    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
+    ha_token = args.get("ha_token", "")
+    horizon = args.get("horizon", "available")
+    days = int(args.get("days", 7))
 
     # Validate
     if not mock and not ha_token:
@@ -483,9 +658,14 @@ def sensitivity_endpoint():
     if horizon not in valid_horizons:
         return jsonify({"error": f"horizon must be one of: {valid_horizons}"}), 400
 
+    try:
+        overrides = build_overrides_from_query(args)
+    except ValueError as e:
+        return jsonify({"error": f"Bad override: {e}"}), 400
+
     # Fetch data (use first day's prices for sensitivity)
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
-        mock, ha_url, ha_token, horizon, days
+        mock, ha_url, ha_token, horizon, days, overrides=overrides
     )
 
     # Calculate start_hour: skip past hours for live runs.
@@ -496,18 +676,35 @@ def sensitivity_endpoint():
         now_warsaw = datetime.now(WARSAW_TZ)
         start_hour = now_warsaw.hour
 
+    # Resolve per-day MaxSOC for the first horizon day so the sweep is
+    # clamped to whatever the user chose (e.g. balance day → 100%).
+    horizon_dates = aux.get("horizon_dates") or []
+    first_day_obj = None
+    if horizon_dates:
+        try:
+            first_day_obj = date.fromisoformat(horizon_dates[0])
+        except ValueError:
+            first_day_obj = None
+
+    day_max_soc = (
+        overrides.max_soc_for_date(first_day_obj)
+        if first_day_obj is not None
+        else overrides.max_soc_pct / 100.0
+    )
+    day_min_soc = overrides.min_soc()
+
     # Run sensitivity (uses first 24h of prices and the matching 24h of loads)
     day_loads = (
         dummy_loads if len(dummy_loads) == 24 else dummy_loads[:24]
     )
     try:
         result, stderr_content = _run_sensitivity(
-            prices[:24], day_loads, initial_soc, start_hour=start_hour
+            prices[:24], day_loads, initial_soc, start_hour=start_hour,
+            max_soc=day_max_soc, min_soc=day_min_soc,
         )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500
 
-    horizon_dates = aux.get("horizon_dates") or []
     out_of_work_set = set(aux.get("out_of_work_days") or [])
     first_date = horizon_dates[0] if horizon_dates else None
 
@@ -519,6 +716,10 @@ def sensitivity_endpoint():
         "raw_consumption_kw": (aux.get("raw_consumption") or [])[:24],
         "solar_forecast_kwh": (aux.get("solar_forecast_kwh") or [])[:24],
         "warnings": stderr_log.strip().splitlines() if stderr_log else [],
+        "advisory": overrides.dry_run,
+        "overrides_active": overrides.summary(),
+        "max_soc_pct": round(day_max_soc * 100, 1),
+        "min_soc_pct": round(day_min_soc * 100, 1),
         **result,
     }
 
