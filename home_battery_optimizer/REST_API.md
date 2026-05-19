@@ -62,6 +62,37 @@ Health check endpoint.
 
 ---
 
+## Prediction-vs-reality feedback loop
+
+The service automatically records every `/optimize` run's per-hour predictions
+(consumption, solar, net load, price) into a local SQLite store at
+`home_battery_optimizer/data/history.db` (override the path with the
+`BATTERY_HISTORY_DB` env var). A nightly `/reconcile` call pulls the
+actuals for the previous day from Home Assistant history, compares them
+against the recorded predictions, and exponentially smooths a learned
+multiplier per `(weekday, hour)` bucket into the `adjustments` table.
+
+Subsequent `/optimize` / `/sensitivity` calls apply those multipliers by
+default — pass `use_adjustments=false` to skip the lookup and get the
+raw, unadjusted result (e.g. for "what would the unadjusted optimizer do?"
+or A/B comparisons).
+
+| Endpoint | Verb | Purpose |
+|---|---|---|
+| `/optimize` | GET/POST | Plus: auto-records predictions, accepts `use_adjustments` |
+| `/sensitivity` | GET/POST | Plus: accepts `use_adjustments` |
+| `/report` | GET | Side-by-side prediction-vs-reality table for one date |
+| `/reconcile` | GET/POST | Pull actuals from HA + update learned multipliers |
+| `/adjustments` | GET / DELETE | Inspect or wipe the learned 7×24 multiplier grid |
+| `/reconciliation_log` | GET | Recent reconciliation runs (with MAPE / bias) |
+
+`use_adjustments` (boolean, default `true`) on `/optimize` and `/sensitivity`
+skips the multiplier lookup entirely. The response always carries an
+`adjustments: { "applied": bool, "buckets": int }` field so callers can
+tell which mode produced the numbers.
+
+---
+
 ### `GET /optimize` (also accepts `POST` with a JSON body)
 
 Run the charging optimization and return JSON results.
@@ -77,6 +108,7 @@ Run the charging optimization and return JSON results.
 | `days` | integer | `7` | No | Days of history to fetch for the weekday×hour consumption profile (≥7 ensures every weekday is represented) |
 | `target_soc` | float | *(none)* | No | Global EOD SOC % (0–100). If omitted or `-1`, optimizer chooses freely. Beaten by `per_date_target_soc` for matching dates. |
 | `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
+| `use_adjustments` | boolean | `true` | No | When `false`, skip the learned `(weekday, hour)` multipliers from `/reconcile` history — i.e. run the optimizer on the raw learned profile without any reality-driven correction. Same flag is supported on `/sensitivity`. |
 
 **GBB-inspired override parameters** (all optional; mirror the most useful knobs from the
 GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
@@ -285,6 +317,172 @@ The response includes `max_soc_pct` / `min_soc_pct` (the bounds the sweep was cl
 
 ```bash
 curl "http://localhost:8000/sensitivity?mock=true"
+```
+
+---
+
+### `GET /report`
+
+Side-by-side prediction-vs-reality table for one calendar date. Pulls the
+latest prediction recorded for each hour (i.e. the most recent `/optimize`
+call that covered the date) and joins it against the actuals stored by
+the last `/reconcile` for that date.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `date` | string (`YYYY-MM-DD`) | yesterday (Warsaw) | Which day to report on |
+
+**Response:**
+```json
+{
+  "target_date": "2026-05-18",
+  "summary": {
+    "consumption_mape": 12.4,
+    "solar_mape": 8.1,
+    "net_load_mape": 14.2,
+    "predicted_net_cost_pln": 18.62,
+    "actual_net_cost_pln": 21.05,
+    "cost_delta_pln": 2.43,
+    "hours_with_prediction": 24,
+    "hours_with_actual": 24,
+    "hours_compared": 24
+  },
+  "rows": [
+    {
+      "hour": 0,
+      "weekday": 0,
+      "price_plkwh": 0.813,
+      "predicted_consumption_kw": 0.80,
+      "actual_consumption_kw": 0.92,
+      "consumption_err_pct": 15.0,
+      "predicted_solar_kwh": 0.0,
+      "actual_solar_kwh": 0.0,
+      "solar_err_pct": null,
+      "predicted_net_load_kw": 0.80,
+      "actual_net_load_kw": 0.92,
+      "net_err_pct": 15.0
+    }
+  ]
+}
+```
+
+`*_mape` are mean absolute percentage errors; `cost_delta_pln = actual - predicted`.
+
+---
+
+### `GET /reconcile` (also accepts `POST`)
+
+Pull the actual per-hour consumption and solar values for one or more
+completed days from Home Assistant history, write them into the `actuals`
+table, then update the learned `(weekday, hour)` multipliers using:
+
+```
+new_mult = alpha * (actual / predicted) + (1 - alpha) * old_mult
+```
+
+with `actual / predicted` clamped to `[0.5, 2.0]` to suppress one-off
+spikes, and near-zero predictions (≤ 0.05 kW / kWh) skipped to avoid
+divide-by-zero blow-ups.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `date` | string (`YYYY-MM-DD`) | *(none)* | Reconcile exactly this date |
+| `days_back` | int | `1` | If `date` is omitted: reconcile the last N completed days |
+| `mock` | boolean | `false` | Skip the HA fetch — just reconcile against actuals already in the DB |
+| `ha_url` | string | `https://ha.kompfix.pl` | HA base URL |
+| `ha_token` | string | *(none)* | Required unless `mock=true` |
+| `alpha` | float | `0.25` | EWMA learning rate (higher = faster adapt, more jitter) |
+
+**Response:**
+```json
+{
+  "alpha": 0.25,
+  "results": [
+    {
+      "target_date": "2026-05-18",
+      "hours_reconciled": 24,
+      "consumption_mape": 12.4,
+      "solar_mape": 8.1,
+      "consumption_bias": 0.12,
+      "solar_bias": -0.08,
+      "updated_buckets": 24,
+      "notes": "updated 24 buckets across 24 hours (alpha=0.25)"
+    }
+  ]
+}
+```
+
+`*_bias = mean(actual/predicted) - 1` — positive means actuals exceeded
+predictions on average (you're using more than the optimizer expects).
+
+**Suggested cron** (call from your scheduler at ~03:00 daily):
+```
+0 3 * * * curl -X POST "http://localhost:8000/reconcile?ha_token=$HA_TOKEN"
+```
+
+---
+
+### `GET /adjustments` and `DELETE /adjustments`
+
+`GET` returns the full 7×24 multiplier grid (one cell per `(weekday, hour)`),
+including cells that have never been updated (their multipliers default to
+`1.0`).
+
+`DELETE` wipes the table — handy when the consumption pattern has shifted
+(new appliance, new schedule) and the old learning is misleading.
+
+**Response (GET):**
+```json
+{
+  "buckets": 48,
+  "grid": [
+    {
+      "weekday": 0,
+      "hour": 0,
+      "consumption_multiplier": 1.12,
+      "solar_multiplier": 1.0,
+      "sample_count": 4,
+      "updated_at": "2026-05-19T03:00:12+00:00"
+    }
+  ]
+}
+```
+
+**Response (DELETE):**
+```json
+{ "reset": true, "rows_deleted": 168 }
+```
+
+---
+
+### `GET /reconciliation_log`
+
+Recent reconciliation runs, newest first. Useful for "is the cron job
+actually running?" health checks.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | `20` | Max rows (clamped to `1..200`) |
+
+**Response:**
+```json
+{
+  "limit": 20,
+  "log": [
+    {
+      "id": 3,
+      "target_date": "2026-05-18",
+      "reconciled_at": "2026-05-19T03:00:12+00:00",
+      "hours_reconciled": 24,
+      "consumption_mape": 12.4,
+      "solar_mape": 8.1,
+      "consumption_bias": 0.12,
+      "solar_bias": -0.08,
+      "notes": "updated 24 buckets across 24 hours (alpha=0.25)"
+    }
+  ],
+  "reconciled_dates": ["2026-05-18", "2026-05-17"]
+}
 ```
 
 ---

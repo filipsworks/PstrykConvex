@@ -16,3 +16,6 @@ build/
 
 # Supervisor generated config (paths resolved at runtime)
 home_battery_optimizer/supervisord.generated.conf
+
+# Prediction-vs-reality SQLite store (runtime data)
+home_battery_optimizer/data/

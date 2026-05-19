@@ -18,7 +18,7 @@ Endpoints:
 import json
 import sys
 from contextlib import redirect_stderr
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Optional
@@ -37,6 +37,9 @@ from api import fetch_all_data  # noqa: E402
 from battery_model import voltage_to_soc  # noqa: E402
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize  # noqa: E402
 from overrides import OptimizerOverrides, build_overrides_from_query  # noqa: E402
+
+import history_db  # noqa: E402
+import reconciliation  # noqa: E402
 
 # ── Mock data (fallback when API unavailable) ─────────────────────────────
 
@@ -191,11 +194,16 @@ def _apply_overrides_to_mock(
     to the net-load list (scale + extra loads + hard replacement).
 
     Profile replacement and solar correction are no-ops in mock mode because
-    the mock data is already a fixed net-load vector.
+    the mock data is already a fixed net-load vector.  Learned multipliers
+    are applied using today's weekday for every hour of the mock block.
     """
     if overrides is None:
         return list(base_loads)
-    loads = [v * overrides.consumption_scale for v in base_loads]
+    today_wd = datetime.now(WARSAW_TZ).weekday()
+    loads = [
+        v * overrides.consumption_scale * overrides.consumption_adjustment_for(today_wd, i % 24)
+        for i, v in enumerate(base_loads)
+    ]
     for load in overrides.extra_loads:
         day_idx = load.get("day", 0)
         base = day_idx * 24
@@ -475,6 +483,98 @@ def _request_args() -> dict:
     return merged
 
 
+def _apply_history_adjustments(
+    overrides: OptimizerOverrides, use_adjustments: bool
+) -> dict:
+    """Fold the reconciled per-(weekday, hour) multipliers into ``overrides``.
+
+    When ``use_adjustments`` is false the override fields stay ``None`` and
+    the optimizer behaves as if no reconciliation history existed at all
+    (useful for "what-if" runs, A/B comparisons, or the first call after a
+    full reset).
+
+    Returns a short summary that the caller can include in the response
+    (number of buckets active + whether learning was bypassed).
+    """
+    if not use_adjustments:
+        overrides.consumption_adjustment = None
+        overrides.solar_adjustment = None
+        return {"applied": False, "buckets": 0}
+
+    raw = history_db.get_adjustments()
+    cons_map: dict[tuple[int, int], float] = {}
+    sol_map: dict[tuple[int, int], float] = {}
+    for key, vals in raw.items():
+        cm = vals.get("consumption_multiplier")
+        sm = vals.get("solar_multiplier")
+        if cm is not None:
+            cons_map[key] = float(cm)
+        if sm is not None:
+            sol_map[key] = float(sm)
+    overrides.consumption_adjustment = cons_map or None
+    overrides.solar_adjustment = sol_map or None
+    return {"applied": True, "buckets": len(raw)}
+
+
+def _record_predictions_for_response(
+    responses: list[dict], adjustments_applied: bool
+) -> None:
+    """Persist per-hour predictions from a successful /optimize response.
+
+    The response we send back already has everything we need (one block per
+    day with `date`, `decisions`, `raw_consumption_kw`, `solar_forecast_kwh`).
+    We capture it row-by-row so subsequent reconciliation can join on
+    (target_date, hour).
+
+    Failures here are swallowed — the user's run already succeeded; we
+    don't want a DB hiccup to bubble up as a 500.
+    """
+    try:
+        for day in responses:
+            target_date = day.get("date")
+            if not target_date:
+                continue
+            try:
+                day_obj = date.fromisoformat(target_date)
+            except (TypeError, ValueError):
+                continue
+            weekday = day_obj.weekday()
+            cons_block = day.get("raw_consumption_kw") or []
+            sol_block = day.get("solar_forecast_kwh") or []
+            decisions = day.get("decisions") or []
+            rows = []
+            for d in decisions:
+                hour = d.get("hour")
+                if hour is None:
+                    continue
+                cons = cons_block[hour] if hour < len(cons_block) else None
+                sol = sol_block[hour] if hour < len(sol_block) else None
+                # The optimizer-visible net load is consumption − solar
+                # (clamped at 0), matching what _build_net_load produced.
+                net = (
+                    max(0.0, (cons or 0.0) - (sol or 0.0))
+                    if cons is not None
+                    else None
+                )
+                rows.append(
+                    {
+                        "target_date": target_date,
+                        "hour": hour,
+                        "weekday": weekday,
+                        "predicted_consumption_kw": cons,
+                        "predicted_solar_kwh": sol,
+                        "predicted_net_load_kw": net,
+                        "price_plkwh": d.get("price_plkwh"),
+                        "adjustments_applied": adjustments_applied,
+                    }
+                )
+            if rows:
+                history_db.record_predictions(rows)
+    except Exception as e:  # noqa: BLE001
+        # Log but don't fail the user's request.
+        print(f"[history] record_predictions failed: {e}", file=sys.stderr)
+
+
 @app.route("/optimize", methods=["GET", "POST"])
 def optimize_endpoint():
     """Run optimization and return JSON results.
@@ -552,6 +652,11 @@ def optimize_endpoint():
     except ValueError as e:
         return jsonify({"error": f"Bad override: {e}"}), 400
 
+    use_adjustments = _parse_bool(args.get("use_adjustments"))
+    if use_adjustments is None:
+        use_adjustments = True
+    adj_meta = _apply_history_adjustments(overrides, use_adjustments)
+
     # Fetch data with overrides applied to consumption/solar/net-load
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
         mock, ha_url, ha_token, horizon, days, overrides=overrides
@@ -616,13 +721,19 @@ def optimize_endpoint():
                 else [],
                 "advisory": overrides.dry_run,
                 "overrides_active": overrides.summary(),
+                "adjustments": adj_meta,
             }
         )
+
+    # Record predictions for later reconciliation (best-effort, never fatal).
+    _record_predictions_for_response(responses, adj_meta.get("applied", False))
 
     # Return single object or list depending on number of days
     if len(responses) == 1:
         return jsonify(responses[0])
-    return jsonify({"days": responses, "advisory": overrides.dry_run})
+    return jsonify(
+        {"days": responses, "advisory": overrides.dry_run, "adjustments": adj_meta}
+    )
 
 
 @app.route("/sensitivity", methods=["GET", "POST"])
@@ -662,6 +773,11 @@ def sensitivity_endpoint():
         overrides = build_overrides_from_query(args)
     except ValueError as e:
         return jsonify({"error": f"Bad override: {e}"}), 400
+
+    use_adjustments = _parse_bool(args.get("use_adjustments"))
+    if use_adjustments is None:
+        use_adjustments = True
+    adj_meta = _apply_history_adjustments(overrides, use_adjustments)
 
     # Fetch data (use first day's prices for sensitivity)
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
@@ -718,6 +834,7 @@ def sensitivity_endpoint():
         "warnings": stderr_log.strip().splitlines() if stderr_log else [],
         "advisory": overrides.dry_run,
         "overrides_active": overrides.summary(),
+        "adjustments": adj_meta,
         "max_soc_pct": round(day_max_soc * 100, 1),
         "min_soc_pct": round(day_min_soc * 100, 1),
         **result,
@@ -730,6 +847,154 @@ def sensitivity_endpoint():
 def health():
     """Health check endpoint."""
     return jsonify({"status": "ok"})
+
+
+# ── Prediction-vs-reality tracking ─────────────────────────────────────────
+
+
+@app.route("/report", methods=["GET"])
+def report_endpoint():
+    """Return a prediction-vs-reality report for one date.
+
+    Query params:
+        date   — YYYY-MM-DD (default: yesterday in Warsaw local time)
+    """
+    args = _request_args()
+    today_warsaw = datetime.now(WARSAW_TZ).date()
+    target = args.get("date") or (today_warsaw - timedelta(days=1)).isoformat()
+    try:
+        date.fromisoformat(target)
+    except ValueError:
+        return jsonify({"error": f"Bad date '{target}', expected YYYY-MM-DD"}), 400
+    return jsonify(reconciliation.build_report(target))
+
+
+@app.route("/reconcile", methods=["GET", "POST"])
+def reconcile_endpoint():
+    """Pull actuals from HA for a given date and update learned multipliers.
+
+    Query params:
+        date            — YYYY-MM-DD to reconcile (default: yesterday)
+        days_back       — Alternative: reconcile the last N completed days
+                          (default: 1 when 'date' is not provided)
+        mock            — true → skip HA fetch, just rerun reconciliation
+                          against actuals already in the DB
+        ha_url          — HA base URL (default https://ha.kompfix.pl)
+        ha_token        — HA long-lived access token (required unless mock)
+        alpha           — EWMA learning rate (default 0.25)
+
+    Returns one entry per reconciled date.
+    """
+    args = _request_args()
+    mock = _parse_bool(args.get("mock")) or False
+    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
+    ha_token = args.get("ha_token", "")
+    alpha_raw = args.get("alpha")
+    alpha = float(alpha_raw) if alpha_raw is not None else reconciliation.DEFAULT_ALPHA
+
+    if not mock and not ha_token:
+        return jsonify({"error": "Either mock=true or ha_token is required"}), 400
+
+    date_str = args.get("date")
+    days_back_raw = args.get("days_back")
+
+    today_warsaw = datetime.now(WARSAW_TZ).date()
+
+    targets: list[date] = []
+    if date_str:
+        try:
+            targets.append(date.fromisoformat(date_str))
+        except ValueError:
+            return jsonify({"error": f"Bad date '{date_str}'"}), 400
+    else:
+        days_back = int(days_back_raw) if days_back_raw else 1
+        if days_back < 1 or days_back > 60:
+            return jsonify({"error": "days_back must be 1..60"}), 400
+        for off in range(1, days_back + 1):
+            targets.append(today_warsaw - timedelta(days=off))
+
+    results = []
+    for d in targets:
+        if not mock:
+            base_url = _build_base_url(ha_url)
+            try:
+                reconciliation.pull_actuals_from_ha(
+                    base_url=base_url, token=ha_token, target_date=d
+                )
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"target_date": d.isoformat(), "error": str(e)}
+                )
+                continue
+        r = reconciliation.reconcile_date(d.isoformat(), alpha=alpha)
+        results.append(
+            {
+                "target_date": r.target_date,
+                "hours_reconciled": r.hours_reconciled,
+                "consumption_mape": r.consumption_mape,
+                "solar_mape": r.solar_mape,
+                "consumption_bias": r.consumption_bias,
+                "solar_bias": r.solar_bias,
+                "updated_buckets": len(r.updated_buckets),
+                "notes": r.notes,
+            }
+        )
+    return jsonify({"alpha": alpha, "results": results})
+
+
+@app.route("/adjustments", methods=["GET", "DELETE"])
+def adjustments_endpoint():
+    """List or reset learned multipliers.
+
+    GET returns a 7x24 grid (weekday x hour) of consumption and solar
+    multipliers plus their sample counts.  DELETE wipes the table — handy
+    when the consumption pattern has shifted (new appliance, new schedule)
+    and the old learning is misleading.
+    """
+    if request.method == "DELETE":
+        rows = history_db.reset_adjustments()
+        return jsonify({"reset": True, "rows_deleted": rows})
+
+    raw = history_db.get_adjustments()
+    # Materialise a dense grid so dashboards don't have to fill holes.
+    grid = []
+    for wd in range(7):
+        for h in range(24):
+            cell = raw.get((wd, h))
+            grid.append(
+                {
+                    "weekday": wd,
+                    "hour": h,
+                    "consumption_multiplier": cell["consumption_multiplier"] if cell else 1.0,
+                    "solar_multiplier": cell["solar_multiplier"] if cell else 1.0,
+                    "sample_count": cell["sample_count"] if cell else 0,
+                    "updated_at": cell["updated_at"] if cell else None,
+                }
+            )
+    return jsonify(
+        {
+            "buckets": len(raw),
+            "grid": grid,
+        }
+    )
+
+
+@app.route("/reconciliation_log", methods=["GET"])
+def reconciliation_log_endpoint():
+    """Return recent reconciliation runs (newest first)."""
+    args = _request_args()
+    limit_raw = args.get("limit", "20")
+    try:
+        limit = max(1, min(200, int(limit_raw)))
+    except (ValueError, TypeError):
+        limit = 20
+    return jsonify(
+        {
+            "limit": limit,
+            "log": history_db.recent_reconciliations(limit=limit),
+            "reconciled_dates": history_db.reconciled_dates(),
+        }
+    )
 
 
 # ── ASGI wrapper for uvicorn (Flask is WSGI, uvicorn expects ASGI) ────────

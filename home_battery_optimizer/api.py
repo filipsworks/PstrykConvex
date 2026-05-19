@@ -317,6 +317,181 @@ def _empty_consumption_profile() -> dict:
     }
 
 
+# ── Reality fetchers (for prediction-vs-reality reconciliation) ────────────
+
+
+def _bucket_history_by_local_hour(
+    data: list,
+    target_date: date,
+) -> list[list[float]]:
+    """Group HA history entries into 24 local-hour buckets for ``target_date``.
+
+    ``data`` is the parsed JSON returned by ``/api/history/period`` for a
+    single entity (i.e. ``data[0]`` of the HA payload).  Entries outside the
+    requested calendar date (Warsaw local) are silently dropped.
+    """
+    buckets: list[list[float]] = [[] for _ in range(24)]
+    target_iso = target_date.isoformat()
+    for entry in data:
+        state = entry.get("state")
+        if state in ("unavailable", "unknown"):
+            continue
+        try:
+            value = float(state)
+        except (ValueError, TypeError):
+            continue
+        ts = entry.get("last_changed", "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            local = dt.astimezone(WARSAW_TZ)
+            if local.date().isoformat() != target_iso:
+                continue
+            buckets[local.hour].append(value)
+        except (ValueError, TypeError):
+            continue
+    return buckets
+
+
+def _median_or_none(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return round(statistics.median(values), 3)
+
+
+def fetch_actual_consumption_for_date(
+    base_url: str, token: str, target_date: date
+) -> list[Optional[float]]:
+    """Per-hour median of inverter output power on a given local date.
+
+    Returns a 24-slot list (``None`` where no data was recorded that hour).
+    """
+    start_local = datetime.combine(target_date, datetime.min.time(), WARSAW_TZ)
+    end_local = start_local + timedelta(days=1)
+
+    start_iso = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_iso = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    url = (
+        f"{base_url}/history/period/{start_iso}?"
+        f"end_time={end_iso}&"
+        f"filter_entity_id=sensor.gniazdo_output_active_power&minimal_response=true"
+    )
+    try:
+        resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return [None] * 24
+
+    if not data or not isinstance(data, list) or not isinstance(data[0], list):
+        return [None] * 24
+
+    buckets = _bucket_history_by_local_hour(data[0], target_date)
+    return [_median_or_none(b) for b in buckets]
+
+
+def fetch_actual_solar_for_date(
+    base_url: str,
+    token: str,
+    target_date: date,
+    sensor_entity: str = "sensor.dom_energy_production_today",
+) -> list[Optional[float]]:
+    """Per-hour realised solar kWh on ``target_date``.
+
+    Strategy:
+      1. Read the configurable ``sensor_entity`` history (default is the
+         forecast sensor, whose ``wh_period`` attribute is updated over the
+         day with measured production for the past hours).  We pull the
+         last snapshot whose ``last_changed`` falls on the next day and use
+         its ``wh_period`` map — by then the measurements for ``target_date``
+         are final.
+      2. If that fails, fall back to ``None``-filled list so the caller can
+         skip solar reconciliation for the day.
+    """
+    # Window: the day after target_date in Warsaw — the sensor will have
+    # finalised yesterday's wh_period numbers by 00:00–06:00 local time.
+    start_local = datetime.combine(target_date + timedelta(days=1), datetime.min.time(), WARSAW_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_iso = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_iso = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    url = (
+        f"{base_url}/history/period/{start_iso}?"
+        f"end_time={end_iso}&"
+        f"filter_entity_id={sensor_entity}"
+    )
+    try:
+        resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return [None] * 24
+
+    if not data or not isinstance(data, list) or not isinstance(data[0], list):
+        return [None] * 24
+
+    target_iso = target_date.isoformat()
+    hourly_wh = [0.0] * 24
+    found_any = False
+    # Look at every snapshot in the window; later snapshots overwrite earlier
+    # so the final value reflects the most authoritative wh_period for the
+    # target date's hours.
+    for entry in data[0]:
+        wh_period = entry.get("attributes", {}).get("wh_period", {}) if isinstance(entry, dict) else {}
+        if not wh_period:
+            continue
+        rebuilt = [0.0] * 24
+        matched = False
+        for ts_str, wh in wh_period.items():
+            try:
+                dt = datetime.fromisoformat(ts_str)
+                local = dt.astimezone(WARSAW_TZ) if dt.tzinfo else dt
+                if local.date().isoformat() != target_iso:
+                    continue
+                hr = local.hour
+                if 0 <= hr < 24:
+                    rebuilt[hr] += float(wh)
+                    matched = True
+            except (ValueError, TypeError):
+                continue
+        if matched:
+            hourly_wh = rebuilt
+            found_any = True
+
+    if not found_any:
+        return [None] * 24
+
+    return [round(v / 1000.0, 4) for v in hourly_wh]
+
+
+def fetch_actuals_for_date(
+    base_url: str,
+    token: str,
+    target_date: date,
+    solar_sensor: str = "sensor.dom_energy_production_today",
+) -> dict:
+    """One-stop call: return per-hour actual consumption + solar for a date.
+
+    Returns:
+        {
+          "consumption_kw":  [24 floats or None],
+          "solar_kwh":       [24 floats or None],
+          "net_load_kw":     [24 floats or None],  # max(0, cons - solar)
+        }
+    """
+    cons = fetch_actual_consumption_for_date(base_url, token, target_date)
+    sol = fetch_actual_solar_for_date(base_url, token, target_date, solar_sensor)
+    net: list[Optional[float]] = []
+    for c, s in zip(cons, sol):
+        if c is None:
+            net.append(None)
+        elif s is None:
+            net.append(c)
+        else:
+            net.append(round(max(0.0, c - s), 3))
+    return {"consumption_kw": cons, "solar_kwh": sol, "net_load_kw": net}
+
+
 # ── Solar forecast ─────────────────────────────────────────────────────────
 
 
@@ -491,6 +666,11 @@ def _build_net_load(
         cons_kw = profiles.get(wd, overall_hourly)[hour]
         # (2) Consumption scale.
         cons_kw *= overrides.consumption_scale
+        # (2b) Learned per-(weekday, hour) consumption multiplier from
+        # reconciliation history.  1.0 (no-op) when nothing has been
+        # observed for that bucket yet, or when use_adjustments=false at the
+        # REST layer (in which case the field is None).
+        cons_kw *= overrides.consumption_adjustment_for(wd, hour)
 
         # Pick the right solar day. Block 0 = today's solar, block 1 = tomorrow's.
         if block_idx == 0:
@@ -505,6 +685,8 @@ def _build_net_load(
             sol_kwh = overrides.solar_override_kwh[i]
         # (4) Solar scale (correction factor).
         sol_kwh *= overrides.solar_scale
+        # (4b) Learned per-(weekday, hour) solar multiplier.
+        sol_kwh *= overrides.solar_adjustment_for(wd, hour)
 
         # (5) 1-hour buckets, so kWh ≈ kW for the purposes of subtraction.
         net_kw = max(0.0, cons_kw - sol_kwh)
