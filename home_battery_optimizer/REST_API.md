@@ -71,11 +71,21 @@ Run the charging optimization and return JSON results.
 | Parameter | Type | Default | Required | Description |
 |---|---|---|---|---|
 | `mock` | boolean | `false` | No (unless no token) | Use sample data instead of Home Assistant API |
-| `ha_url` | string | `https://ha-finland.kompfix.pl` | No | Home Assistant base URL (without `/api`) |
+| `ha_url` | string | `https://ha.kompfix.pl` | No | Home Assistant base URL (without `/api`) |
 | `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
 | `horizon` | enum | `available` | No | Which day's prices to optimize: `today`, `tomorrow`, or `available` |
-| `days` | integer | `1` | No | Number of days of history to fetch for load estimation |
+| `days` | integer | `7` | No | Days of history to fetch for the weekday×hour consumption profile (≥7 ensures every weekday is represented) |
 | `target_soc` | float | *(none)* | No | Target end-of-day SOC in percent (0–100). If omitted or `-1`, optimizer chooses freely. |
+
+> **Prediction inputs (live mode):** the optimizer's per-hour load is
+> `max(0, consumption[weekday][hour] − solar_forecast[hour])` where
+> consumption comes from a median per `(weekday, hour-of-day)` over the last
+> `days` of `sensor.gniazdo_output_active_power` (inverter total output),
+> and the solar forecast is read from
+> `sensor.dom_energy_production_today` / `…_tomorrow` (`wh_period` attr).
+> Out-of-work days (weekends + PL public holidays scraped from
+> `kalendarzswiat.pl`) are surfaced on each day's response as
+> `is_out_of_work` and influence the weekday-keyed consumption bucket used.
 | `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
 
 **Response:**
@@ -85,6 +95,10 @@ Run the charging optimization and return JSON results.
   "initial_soc_pct": 35.0,
   "horizon": "available",
   "objective": "min_cost",
+  "date": "2026-05-19",
+  "is_out_of_work": false,
+  "raw_consumption_kw": [0.8, 0.75, ...],
+  "solar_forecast_kwh": [0.0, 0.0, ..., 3.4, 3.1, ...],
   "warnings": [],
   "is_estimated": false,
   "decisions": [
@@ -150,7 +164,7 @@ Run sensitivity analysis: grid cost vs target SOC (0–100%, step 5%). Returns a
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mock` | boolean | `false` | Use sample data |
-| `ha_url` | string | `https://ha-finland.kompfix.pl` | Home Assistant base URL |
+| `ha_url` | string | `https://ha.kompfix.pl` | Home Assistant base URL |
 | `ha_token` | string | *(none)* | HA token (required if `mock=false`) |
 | `horizon` | enum | `available` | Which day's prices: `today`, `tomorrow`, `available` |
 | `days` | integer | `1` | Days of history for load estimation |

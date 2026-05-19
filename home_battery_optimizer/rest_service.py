@@ -104,8 +104,22 @@ def _build_base_url(ha_url: str) -> str:
 
 
 def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
-    """Return (prices, dummy_loads, initial_soc)."""
+    """Return (prices, dummy_loads, initial_soc, aux, stderr_log).
+
+    ``aux`` carries the extra signals folded into the net load so callers can
+    expose them in API responses:
+        - raw_consumption: per-hour kW from weekday×hour history.
+        - solar_forecast_kwh: per-hour kWh from sensor.dom_energy_production_*.
+        - out_of_work_days: dates (within the horizon) that are Sat/Sun/PL holiday.
+        - horizon_dates: calendar date assigned to each 24-hour price block.
+    """
     stderr_capture = StringIO()
+    aux: dict = {
+        "raw_consumption": None,
+        "solar_forecast_kwh": None,
+        "out_of_work_days": None,
+        "horizon_dates": None,
+    }
 
     if mock:
         with redirect_stderr(stderr_capture):
@@ -132,13 +146,17 @@ def _get_data(mock: bool, ha_url: str, ha_token: str, horizon: str, days: int):
             else:
                 prices = data["prices"]
                 dummy_loads = data["dummy_loads"]
+                aux["raw_consumption"] = data.get("raw_consumption")
+                aux["solar_forecast_kwh"] = data.get("solar_forecast_kwh")
+                aux["out_of_work_days"] = data.get("out_of_work_days")
+                aux["horizon_dates"] = data.get("horizon_dates")
                 voltage = data.get("voltage")
                 if voltage is not None:
                     initial_soc = voltage_to_soc(voltage)
                 else:
                     initial_soc = 0.5
 
-    return prices, dummy_loads, initial_soc, stderr_capture.getvalue()
+    return prices, dummy_loads, initial_soc, aux, stderr_capture.getvalue()
 
 
 def _has_estimated_prices(prices):
@@ -206,8 +224,12 @@ def _run_multi_day_optimization(
             break
 
         day_prices = prices[start:end]
-        # Pad dummy loads to match (should already be 24h)
-        day_loads = (dummy_loads * ((end - start) // len(dummy_loads) + 1))[start:end]
+        # dummy_loads is horizon-aligned (matches prices length). For mock it
+        # may be a single 24h list — reuse it for each day in that case.
+        if len(dummy_loads) == 24 and len(prices) > 24:
+            day_loads = dummy_loads
+        else:
+            day_loads = dummy_loads[start:end]
 
         # First day skips past hours; subsequent days optimize full day
         day_start_hour = start_hour if i == 0 else 0
@@ -317,7 +339,7 @@ def optimize_endpoint():
 
     Query parameters:
         mock            — Use sample data (true/false, default: false)
-        ha_url          — Home Assistant base URL (default: https://ha-finland.kompfix.pl)
+        ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
         ha_token        — HA long-lived access token (required unless --mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
         days            — Days of history to fetch (default: 1)
@@ -328,10 +350,10 @@ def optimize_endpoint():
         GET /optimize?ha_url=https://ha.example.com&ha_token=MY_TOKEN&horizon=tomorrow&target_soc=80
     """
     mock = _parse_bool(request.args.get("mock")) or False
-    ha_url = request.args.get("ha_url", "https://ha-finland.kompfix.pl")
+    ha_url = request.args.get("ha_url", "https://ha.kompfix.pl")
     ha_token = request.args.get("ha_token", "")
     horizon = request.args.get("horizon", "available")
-    days = int(request.args.get("days", 1))
+    days = int(request.args.get("days", 7))
     target_soc_raw = request.args.get("target_soc")
 
     # Validate
@@ -365,7 +387,7 @@ def optimize_endpoint():
         return jsonify({"error": "target_soc must be between 0 and 100"}), 400
 
     # Fetch data
-    prices, dummy_loads, initial_soc, stderr_log = _get_data(
+    prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
         mock, ha_url, ha_token, horizon, days
     )
 
@@ -385,6 +407,11 @@ def optimize_endpoint():
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
 
+    horizon_dates = aux.get("horizon_dates") or []
+    out_of_work_set = set(aux.get("out_of_work_days") or [])
+    raw_consumption = aux.get("raw_consumption") or []
+    solar_kwh = aux.get("solar_forecast_kwh") or []
+
     # Build response with day labels
     responses = []
     for i, result in enumerate(all_results):
@@ -400,14 +427,22 @@ def optimize_endpoint():
                 "Tomorrow's pricing data unavailable — using today's prices as estimation"
             )
 
+        block_date = horizon_dates[i] if i < len(horizon_dates) else None
+        block_raw = raw_consumption[i * 24 : (i + 1) * 24] if raw_consumption else []
+        block_solar = solar_kwh[i * 24 : (i + 1) * 24] if solar_kwh else []
+
         responses.append(
             {
                 "day_label": date_label,
+                "date": block_date,
+                "is_out_of_work": block_date in out_of_work_set if block_date else None,
                 "objective": objective,
                 "initial_soc_pct": round(result["decisions"][0]["soc_pct"], 1)
                 if result["decisions"]
                 else round(initial_soc * 100, 1),
                 **result,
+                "raw_consumption_kw": block_raw,
+                "solar_forecast_kwh": block_solar,
                 "warnings": day_warnings + stderr_log.strip().splitlines()
                 if stderr_log
                 else [],
@@ -426,7 +461,7 @@ def sensitivity_endpoint():
 
     Query parameters:
         mock            — Use sample data (true/false, default: false)
-        ha_url          — Home Assistant base URL (default: https://ha-finland.kompfix.pl)
+        ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
         ha_token        — HA long-lived access token (required unless --mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
         days            — Days of history to fetch (default: 1)
@@ -435,10 +470,10 @@ def sensitivity_endpoint():
         GET /sensitivity?mock=true
     """
     mock = _parse_bool(request.args.get("mock")) or False
-    ha_url = request.args.get("ha_url", "https://ha-finland.kompfix.pl")
+    ha_url = request.args.get("ha_url", "https://ha.kompfix.pl")
     ha_token = request.args.get("ha_token", "")
     horizon = request.args.get("horizon", "available")
-    days = int(request.args.get("days", 1))
+    days = int(request.args.get("days", 7))
 
     # Validate
     if not mock and not ha_token:
@@ -449,7 +484,7 @@ def sensitivity_endpoint():
         return jsonify({"error": f"horizon must be one of: {valid_horizons}"}), 400
 
     # Fetch data (use first day's prices for sensitivity)
-    prices, dummy_loads, initial_soc, stderr_log = _get_data(
+    prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
         mock, ha_url, ha_token, horizon, days
     )
 
@@ -461,17 +496,28 @@ def sensitivity_endpoint():
         now_warsaw = datetime.now(WARSAW_TZ)
         start_hour = now_warsaw.hour
 
-    # Run sensitivity (uses first 24h of prices)
+    # Run sensitivity (uses first 24h of prices and the matching 24h of loads)
+    day_loads = (
+        dummy_loads if len(dummy_loads) == 24 else dummy_loads[:24]
+    )
     try:
         result, stderr_content = _run_sensitivity(
-            prices[:24], dummy_loads, initial_soc, start_hour=start_hour
+            prices[:24], day_loads, initial_soc, start_hour=start_hour
         )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500
 
+    horizon_dates = aux.get("horizon_dates") or []
+    out_of_work_set = set(aux.get("out_of_work_days") or [])
+    first_date = horizon_dates[0] if horizon_dates else None
+
     response = {
         "initial_soc_pct": round(initial_soc * 100, 1),
         "horizon": horizon,
+        "date": first_date,
+        "is_out_of_work": first_date in out_of_work_set if first_date else None,
+        "raw_consumption_kw": (aux.get("raw_consumption") or [])[:24],
+        "solar_forecast_kwh": (aux.get("solar_forecast_kwh") or [])[:24],
         "warnings": stderr_log.strip().splitlines() if stderr_log else [],
         **result,
     }

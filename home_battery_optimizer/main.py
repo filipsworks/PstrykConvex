@@ -88,9 +88,9 @@ MOCK_DUMMY_LOADS = [
 @click.option("--mock", is_flag=True, help="Use sample data instead of API")
 @click.option(
     "--ha-url",
-    default="https://ha-finland.kompfix.pl",
+    default="https://ha.kompfix.pl",
     show_default=True,
-    help="Home Assistant base URL (e.g. https://ha-finland.kompfix.pl). /api is appended automatically.",
+    help="Home Assistant base URL (e.g. https://ha.kompfix.pl). /api is appended automatically.",
 )
 @click.option(
     "--ha-token",
@@ -108,9 +108,12 @@ MOCK_DUMMY_LOADS = [
 @click.option(
     "--days",
     type=int,
-    default=1,
+    default=7,
     show_default=True,
-    help="Number of days to fetch history for (default: 1)",
+    help=(
+        "Days of history to fetch for the weekday×hour consumption "
+        "profile (default: 7, the minimum to cover every weekday)."
+    ),
 )
 @click.option(
     "--output",
@@ -210,6 +213,8 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
     elif args.horizon == "tomorrow" and n_days >= 2:
         # Skip today, only optimize tomorrow
         prices = prices[24:]
+        if len(dummy_loads) >= 48:
+            dummy_loads = dummy_loads[24:]
         n_days = 1
 
     for i in range(n_days):
@@ -218,8 +223,12 @@ def main(ctx, mock, ha_url, ha_token, horizon, days, output, target_soc, objecti
         if start >= end:
             break
         day_prices = prices[start:end]
-        # Pad or slice dummy loads to match
-        day_loads = (dummy_loads * ((end - start) // len(dummy_loads) + 1))[start:end]
+        # dummy_loads is now horizon-aligned (same length as prices). For mock,
+        # it's a single 24h list — repeat it to match longer horizons.
+        if len(dummy_loads) == 24 and len(prices) > 24:
+            day_loads = dummy_loads
+        else:
+            day_loads = dummy_loads[start:end]
 
         soc_start = (
             initial_soc
