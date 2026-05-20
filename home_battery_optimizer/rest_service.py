@@ -998,23 +998,29 @@ def reconciliation_log_endpoint():
 
 
 # ── ASGI wrapper for uvicorn (Flask is WSGI, uvicorn expects ASGI) ────────
+# a2wsgi is preferred: starlette's WSGIMiddleware is deprecated and itself
+# points to a2wsgi as the replacement. starlette/uvicorn adapters are kept
+# as fallbacks.
 
 try:
-    from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+    from a2wsgi import WSGIMiddleware  # noqa: E402
 except ImportError:
     try:
-        from uvicorn.middleware.wsgi import WSGIMiddleware  # noqa: E402
+        from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
     except ImportError:
-        raise RuntimeError(
-            "Neither 'starlette' nor 'uvicorn[standard]' is installed. "
-            "Install one of these to run with uvicorn:\n"
-            "  pip install starlette\n"
-            "or\n"
-            "  pip install uvicorn[standard]\n"
-            "\n"
-            "Alternatively, use Flask's built-in server:\n"
-            "  python rest_service.py [--host 0.0.0.0] [--port 8000]"
-        )
+        try:
+            from uvicorn.middleware.wsgi import WSGIMiddleware  # noqa: E402
+        except ImportError:
+            raise RuntimeError(
+                "No WSGI->ASGI adapter found. Install one of these to run "
+                "with uvicorn:\n"
+                "  pip install a2wsgi\n"
+                "  pip install starlette\n"
+                "  pip install uvicorn[standard]\n"
+                "\n"
+                "Alternatively, use Flask's built-in server:\n"
+                "  python rest_service.py [--host 0.0.0.0] [--port 8000]"
+            )
 
 asgi_app = WSGIMiddleware(app)
 
