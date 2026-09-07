@@ -138,7 +138,7 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > **Prediction inputs (live mode):** the optimizer's per-hour load is
 > `max(0, consumption[weekday][hour] − solar_forecast[hour])` where
 > consumption comes from a median per `(weekday, hour-of-day)` over the last
-> `days` of `sensor.gniazdo_output_active_power` (inverter total output),
+> `days` of `sensor.inverter_e50000254944442369_dessmonitor_output_power` (inverter total AC output, reported in W and scaled to kW),
 > and the solar forecast is read from
 > `sensor.dom_energy_production_today` / `…_tomorrow` (`wh_period` attr).
 > Out-of-work days (weekends + PL public holidays scraped from

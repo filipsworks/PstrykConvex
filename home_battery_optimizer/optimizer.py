@@ -9,6 +9,7 @@ from battery_model import (
     CHARGE_EFFICIENCY,
     CHARGE_STEPS_A,
     DISCHARGE_EFFICIENCY,
+    MAX_CHARGE_POWER_KW,
     MAX_SOC,
     MIN_SOC,
     NOMINAL_VOLTAGE,
@@ -50,7 +51,7 @@ def _build_and_solve(
     capacity_wh = TOTAL_CAPACITY_WH
     eta_ch = CHARGE_EFFICIENCY
     eta_inv = DISCHARGE_EFFICIENCY
-    max_p_charge_kw = min(max_charge_power_kw(), 2.0)
+    max_p_charge_kw = min(max_charge_power_kw(), MAX_CHARGE_POWER_KW)
     max_discharge_kw = NOMINAL_VOLTAGE * CAPACITY_AH / 1000 * 0.5
 
     price_array = np.array([p["price"] for p in prices])

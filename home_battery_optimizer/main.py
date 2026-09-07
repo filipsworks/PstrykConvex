@@ -470,7 +470,7 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
             8, max(len(d["output_mode"] + "/" + d["charger_mode"]) for d in decisions)
         )
         price_w = 7
-        charge_w = 14  # e.g. "+1.82 kWh @ 70A" or "-1.44 kWh"
+        charge_w = 14  # e.g. "+4.68 kWh @ 90A" or "-1.44 kWh"
         soc_w = 7  # " 35.0%"
         grid_cost_w = 9  # actual grid spend: "    0.6504"
         total_cost_w = 9  # total active power cost: "    1.2840"

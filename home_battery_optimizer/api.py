@@ -18,6 +18,32 @@ except ImportError:
     WARSAW_TZ = timezone.utc  # Python < 3.9 fallback
 
 
+# ── Home Assistant entity IDs (DessMonitor integration, SandiSolar 11 kW) ──
+# Replaced the retired "Solar of Things" ``sensor.gniazdo_*`` entities in 2026-09.
+BATTERY_VOLTAGE_ENTITY = (
+    "sensor.inverter_e50000254944442369_dessmonitor_battery_voltage"
+)
+INVERTER_OUTPUT_POWER_ENTITY = (
+    "sensor.inverter_e50000254944442369_dessmonitor_output_power"
+)
+# DessMonitor reports output power in W; the whole optimizer works in kW.
+INVERTER_OUTPUT_POWER_TO_KW = 0.001
+
+# Consumption-profile sources as (entity_id, factor-to-kW). The retired
+# "Solar of Things" sensor reported kW and stopped updating 2026-09-06; it is
+# kept only so the weekday profile has a full 7 days of history during the
+# changeover. HA's recorder keeps ~10 days, so it goes silent on its own.
+# ponytail: drop the legacy entry once the new sensor has 7 days of history
+# (from ~2026-09-14) — until then the profile would be a flat 1.5 kW fallback.
+CONSUMPTION_SOURCES = (
+    (INVERTER_OUTPUT_POWER_ENTITY, INVERTER_OUTPUT_POWER_TO_KW),
+    ("sensor.gniazdo_output_active_power", 1.0),
+)
+
+SOLAR_FORECAST_TODAY_ENTITY = "sensor.dom_energy_production_today"
+SOLAR_FORECAST_TOMORROW_ENTITY = "sensor.dom_energy_production_tomorrow"
+
+
 # In-process cache for the Polish holiday scrape (one HTTP call per year per run).
 _HOLIDAYS_CACHE: dict[int, set[str]] = {}
 
@@ -139,7 +165,7 @@ def fetch_hourly_prices(
 
 def fetch_battery_voltage(base_url: str, token: str) -> Optional[float]:
     """Fetch current battery voltage."""
-    url = f"{base_url}/states/sensor.gniazdo_battery_voltage"
+    url = f"{base_url}/states/{BATTERY_VOLTAGE_ENTITY}"
     resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
     if resp.status_code != 200:
         return None
@@ -153,54 +179,6 @@ def fetch_battery_voltage(base_url: str, token: str) -> Optional[float]:
         return None
 
 
-def fetch_battery_history(base_url: str, token: str, days: int = 1) -> dict:
-    """Fetch battery voltage and current history for the last N days."""
-    end_dt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    start_dt = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z"
-    )
-
-    url = (
-        f"{base_url}/history/period/{start_dt}?"
-        f"end_time={end_dt}&"
-        f"filter_entity_id=sensor.gniazdo_battery_voltage,"
-        f"sensor.gniazdo_battery_charging_current,"
-        f"sensor.gniazdo_battery_discharge_current&minimal_response=true"
-    )
-    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
-    if resp.status_code != 200:
-        return {"voltage": None, "charging": [], "discharging": []}
-
-    data = resp.json()
-    result = {"voltage": None, "charging": [], "discharging": []}
-
-    for entity_data in data:
-        if not isinstance(entity_data, list):
-            continue
-        entity_id = entity_data[0].get("entity_id", "") if entity_data else ""
-
-        for entry in entity_data:
-            state = entry.get("state")
-            if state in ("unavailable", "unknown"):
-                continue
-            try:
-                val = float(state)
-            except (ValueError, TypeError):
-                continue
-
-            ts = entry.get("last_changed", "")
-            point = {"time": ts, "value": val}
-
-            if "voltage" in entity_id:
-                result["voltage"] = val  # keep latest
-            elif "charging_current" in entity_id:
-                result["charging"].append(point)
-            elif "discharge_current" in entity_id:
-                result["discharging"].append(point)
-
-    return result
-
-
 # ── Consumption (inverter output) ──────────────────────────────────────────
 
 
@@ -209,9 +187,11 @@ def fetch_consumption_by_weekday(
 ) -> dict:
     """Fetch inverter output power and bucket it by (weekday, hour-of-day).
 
-    Source sensor: ``sensor.gniazdo_output_active_power`` (inverter total output
-    in kW). Per-hour median is computed per weekday over the past ``days`` of
-    history so that workdays and weekends end up with distinct profiles.
+    Sources: :data:`CONSUMPTION_SOURCES` — the DessMonitor inverter total AC
+    output (W, scaled to kW here) plus, during the changeover, the retired
+    ``sensor.gniazdo_output_active_power`` (already kW). Per-hour median is
+    computed per weekday over the past ``days`` of history so that workdays and
+    weekends end up with distinct profiles.
 
     Args:
         base_url: HA API base URL.
@@ -237,7 +217,8 @@ def fetch_consumption_by_weekday(
     url = (
         f"{base_url}/history/period/{start_dt}?"
         f"end_time={end_dt}&"
-        f"filter_entity_id=sensor.gniazdo_output_active_power&minimal_response=true"
+        f"filter_entity_id={','.join(e for e, _ in CONSUMPTION_SOURCES)}"
+        f"&minimal_response=true"
     )
     resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
     if resp.status_code != 200:
@@ -252,15 +233,19 @@ def fetch_consumption_by_weekday(
     by_hour: dict[int, list[float]] = {h: [] for h in range(24)}
     all_values: list[float] = []
 
+    scale_by_entity = dict(CONSUMPTION_SOURCES)
+
     for entity_data in data:
-        if not isinstance(entity_data, list):
+        if not isinstance(entity_data, list) or not entity_data:
             continue
+        # With minimal_response only the first entry carries entity_id.
+        scale = scale_by_entity.get(entity_data[0].get("entity_id", ""), 1.0)
         for entry in entity_data:
             state = entry.get("state")
             if state in ("unavailable", "unknown"):
                 continue
             try:
-                value = float(state)
+                value = float(state) * scale
             except (ValueError, TypeError):
                 continue
 
@@ -361,7 +346,7 @@ def _median_or_none(values: list[float]) -> Optional[float]:
 def fetch_actual_consumption_for_date(
     base_url: str, token: str, target_date: date
 ) -> list[Optional[float]]:
-    """Per-hour median of inverter output power on a given local date.
+    """Per-hour median of inverter output power (kW) on a given local date.
 
     Returns a 24-slot list (``None`` where no data was recorded that hour).
     """
@@ -374,7 +359,7 @@ def fetch_actual_consumption_for_date(
     url = (
         f"{base_url}/history/period/{start_iso}?"
         f"end_time={end_iso}&"
-        f"filter_entity_id=sensor.gniazdo_output_active_power&minimal_response=true"
+        f"filter_entity_id={INVERTER_OUTPUT_POWER_ENTITY}&minimal_response=true"
     )
     try:
         resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
@@ -387,14 +372,17 @@ def fetch_actual_consumption_for_date(
         return [None] * 24
 
     buckets = _bucket_history_by_local_hour(data[0], target_date)
-    return [_median_or_none(b) for b in buckets]
+    # Sensor reports W; the optimizer works in kW.
+    return [
+        _median_or_none([v * INVERTER_OUTPUT_POWER_TO_KW for v in b]) for b in buckets
+    ]
 
 
 def fetch_actual_solar_for_date(
     base_url: str,
     token: str,
     target_date: date,
-    sensor_entity: str = "sensor.dom_energy_production_today",
+    sensor_entity: str = SOLAR_FORECAST_TODAY_ENTITY,
 ) -> list[Optional[float]]:
     """Per-hour realised solar kWh on ``target_date``.
 
@@ -468,7 +456,7 @@ def fetch_actuals_for_date(
     base_url: str,
     token: str,
     target_date: date,
-    solar_sensor: str = "sensor.dom_energy_production_today",
+    solar_sensor: str = SOLAR_FORECAST_TODAY_ENTITY,
 ) -> dict:
     """One-stop call: return per-hour actual consumption + solar for a date.
 
@@ -530,8 +518,8 @@ def fetch_solar_forecast(
     """
     out = {"today": [0.0] * 24, "tomorrow": [0.0] * 24}
     for key, entity in (
-        ("today", "sensor.dom_energy_production_today"),
-        ("tomorrow", "sensor.dom_energy_production_tomorrow"),
+        ("today", SOLAR_FORECAST_TODAY_ENTITY),
+        ("tomorrow", SOLAR_FORECAST_TOMORROW_ENTITY),
     ):
         try:
             url = f"{base_url}/states/{entity}"
@@ -739,7 +727,6 @@ def fetch_all_data(
         dict with:
           - prices: list of hourly price dicts (24 or 48 long).
           - voltage: latest battery voltage (or None).
-          - battery_history: voltage & current series.
           - dummy_loads: net load per horizon hour (consumption − solar, ≥ 0).
                          Length matches ``prices``.
           - raw_consumption: gross consumption per horizon hour (weekday-keyed).
@@ -754,7 +741,6 @@ def fetch_all_data(
 
     prices = fetch_hourly_prices(base_url, token, horizon=horizon)
     voltage = fetch_battery_voltage(base_url, token)
-    battery_hist = fetch_battery_history(base_url, token, days=days)
     consumption = fetch_consumption_by_weekday(base_url, token, days=days)
     solar = fetch_solar_forecast(base_url, token)
 
@@ -776,7 +762,6 @@ def fetch_all_data(
     return {
         "prices": prices,
         "voltage": voltage,
-        "battery_history": battery_hist,
         "dummy_loads": net_load,
         "raw_consumption": raw_consumption,
         "solar_forecast_kwh": solar_per_hour,
