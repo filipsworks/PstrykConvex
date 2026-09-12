@@ -26,6 +26,7 @@ UVICORN="$VENV_DIR/bin/uvicorn"
 # Check if supervisor is available
 HAS_SUPERVISOR=false
 if command -v supervisord &>/dev/null; then
+    SUPERVISORD_BIN="$(command -v supervisord)"
     HAS_SUPERVISOR=true
 elif "$PYTHON" -c "import supervisor" 2>/dev/null; then
     SUPERVISORD_BIN="$VENV_DIR/bin/supervisord"
@@ -57,7 +58,7 @@ for ((i=0; i<${#EXTRA_ARGS[@]}; i++)); do
     esac
 done
 
-if $HAS_SUPERVISOR && ! $FORCE_SUPERVISOR; then
+if $HAS_SUPERVISOR; then
     # ── Supervisor mode (auto-restart) ────────────────────────────────
     echo "[supervisor] Starting under supervisord with auto-restart..."
 
@@ -70,7 +71,7 @@ logfile_maxbytes=0
 pidfile=/tmp/supervisord.pid
 
 [program:home-battery-optimizer]
-command=$UVICORN rest_service:asgi_app --host $UVICORN_HOST --port $UVICORN_PORT
+command="$UVICORN" rest_service:asgi_app --host $UVICORN_HOST --port $UVICORN_PORT
 directory=$SERVICE_DIR
 autostart=true
 autorestart=true
