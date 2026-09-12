@@ -6,7 +6,6 @@ from datetime import date, datetime, timezone
 
 import click
 from api import fetch_all_data
-from battery_model import voltage_to_soc
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize
 from overrides import OptimizerOverrides, build_overrides_from_query
 
@@ -426,16 +425,11 @@ def get_data(args):
             prices = data["prices"]
             dummy_loads = data["dummy_loads"]
             horizon_dates = data.get("horizon_dates") or []
-            voltage = data.get("voltage")
-            if voltage is not None:
-                initial_soc = voltage_to_soc(voltage)
-                click.echo(
-                    f"  Voltage {voltage:.1f} V → SOC {initial_soc * 100:.1f}%",
-                    err=True,
-                )
-            else:
-                initial_soc = 0.5
-                click.echo("  No voltage reading — defaulting to SOC 50%", err=True)
+            initial_soc = data["soc"]
+            click.echo(
+                f"  SOC {initial_soc * 100:.1f}% (source: {data['soc_source']})",
+                err=True,
+            )
 
     return prices, dummy_loads, initial_soc, horizon_dates
 

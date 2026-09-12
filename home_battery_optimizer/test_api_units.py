@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit-scale checks for the DessMonitor changeover in api.py.
+"""Unit-scale and SOC-source checks for api.py.
 
 The new inverter sensor reports output power in **W** while the retired
 "Solar of Things" sensor reported **kW**.  Both feed the same weekday
@@ -73,6 +73,25 @@ def main() -> None:
 
     # Unknown entity must not be silently rescaled by another sensor's factor.
     assert dict(api.CONSUMPTION_SOURCES)[api.INVERTER_OUTPUT_POWER_ENTITY] == 0.001
+
+    # SOC source chain: BMS (incl. last reading during a dropout) → voltage → 0.5.
+    def stub(bms_states, voltage_state):
+        def get(url, *a, **k):
+            if api.BMS_SOC_ENTITY in url:
+                return _Resp([[{"state": st} for st in bms_states]] if bms_states else [])
+            return _Resp({"state": voltage_state})
+        api.requests.get = get  # type: ignore[assignment]
+
+    stub(["19", "20"], "53.2")
+    assert api.fetch_initial_soc("http://x/api", "tok") == (0.2, "bms")
+    stub(["20", "unavailable"], "53.2")  # BLE dropout: keep last BMS reading
+    assert api.fetch_initial_soc("http://x/api", "tok") == (0.2, "bms")
+    stub(["unavailable"], "52.0")  # BMS silent past the window
+    soc, src = api.fetch_initial_soc("http://x/api", "tok")
+    assert src == "voltage" and abs(soc - 0.5) < 1e-9, (soc, src)
+    stub(None, "unavailable")
+    assert api.fetch_initial_soc("http://x/api", "tok") == (0.5, "default")
+    print("  ✓ SOC chain: bms → last bms in window → voltage → default")
 
     print("\nAll checks passed.")
 

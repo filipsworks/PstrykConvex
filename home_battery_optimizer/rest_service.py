@@ -34,7 +34,6 @@ except ImportError:
     WARSAW_TZ = timezone
 
 from api import fetch_all_data  # noqa: E402
-from battery_model import voltage_to_soc  # noqa: E402
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize  # noqa: E402
 from overrides import OptimizerOverrides, build_overrides_from_query  # noqa: E402
 
@@ -143,6 +142,7 @@ def _get_data(
             prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
             dummy_loads = _apply_overrides_to_mock(MOCK_DUMMY_LOADS, overrides)
             initial_soc = 0.35
+            aux["soc_source"] = "mock"
             today = datetime.now(WARSAW_TZ).date()
             aux["raw_consumption"] = list(MOCK_DUMMY_LOADS)
             aux["solar_forecast_kwh"] = [0.0] * 24
@@ -166,6 +166,7 @@ def _get_data(
                 prices = sorted(MOCK_PRICES, key=lambda p: p["hour"])
                 dummy_loads = _apply_overrides_to_mock(MOCK_DUMMY_LOADS, overrides)
                 initial_soc = 0.35
+                aux["soc_source"] = "mock"
                 today = datetime.now(WARSAW_TZ).date()
                 aux["raw_consumption"] = list(MOCK_DUMMY_LOADS)
                 aux["solar_forecast_kwh"] = [0.0] * 24
@@ -178,11 +179,13 @@ def _get_data(
                 aux["solar_forecast_kwh"] = data.get("solar_forecast_kwh")
                 aux["out_of_work_days"] = data.get("out_of_work_days")
                 aux["horizon_dates"] = data.get("horizon_dates")
-                voltage = data.get("voltage")
-                if voltage is not None:
-                    initial_soc = voltage_to_soc(voltage)
-                else:
-                    initial_soc = 0.5
+                initial_soc = data["soc"]
+                aux["soc_source"] = data["soc_source"]
+                if data["soc_source"] != "bms":
+                    stderr_capture.write(
+                        f"[warn] JK BMS SOC unavailable — initial SOC from "
+                        f"{data['soc_source']}\n"
+                    )
 
     return prices, dummy_loads, initial_soc, aux, stderr_capture.getvalue()
 
@@ -713,6 +716,7 @@ def optimize_endpoint():
                 "initial_soc_pct": round(result["decisions"][0]["soc_pct"], 1)
                 if result["decisions"]
                 else round(initial_soc * 100, 1),
+                "initial_soc_source": aux.get("soc_source"),
                 **result,
                 "raw_consumption_kw": block_raw,
                 "solar_forecast_kwh": block_solar,

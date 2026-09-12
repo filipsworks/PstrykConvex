@@ -147,9 +147,15 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 
 **Response:**
 
+> **Initial SOC:** read from the JK BMS (`sensor.jk_bms_soc`, last reading
+> within 15 min so short BLE dropouts don't matter). If the BMS has been
+> silent longer, it falls back to the pack-voltage estimate and a warning is
+> added. `initial_soc_source` is `bms`, `voltage`, `default` (0.5) or `mock`.
+
 ```json
 {
   "initial_soc_pct": 35.0,
+  "initial_soc_source": "bms",
   "horizon": "available",
   "objective": "min_cost",
   "date": "2026-05-19",

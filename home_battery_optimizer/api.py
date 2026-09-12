@@ -8,6 +8,7 @@ from typing import Optional
 
 import requests
 
+from battery_model import voltage_to_soc
 from overrides import OptimizerOverrides
 
 try:
@@ -39,6 +40,13 @@ CONSUMPTION_SOURCES = (
     (INVERTER_OUTPUT_POWER_ENTITY, INVERTER_OUTPUT_POWER_TO_KW),
     ("sensor.gniazdo_output_active_power", 1.0),
 )
+
+# JK BMS (template helpers over sensor.jk_bms). The helper goes "unavailable"
+# once sensor.jk_bms has been silent for 60 s (BLE dropouts of ~8 min seen).
+BMS_SOC_ENTITY = "sensor.jk_bms_soc"
+# Oldest BMS SOC reading still trusted over the voltage estimate. At 90 A the
+# pack moves ~1 % every 2 min, so 15 min bounds the error to roughly 7 %.
+BMS_SOC_MAX_AGE_MIN = 15
 
 SOLAR_FORECAST_TODAY_ENTITY = "sensor.dom_energy_production_today"
 SOLAR_FORECAST_TOMORROW_ENTITY = "sensor.dom_energy_production_tomorrow"
@@ -177,6 +185,55 @@ def fetch_battery_voltage(base_url: str, token: str) -> Optional[float]:
         return float(state)
     except (ValueError, TypeError):
         return None
+
+
+def fetch_bms_soc(
+    base_url: str, token: str, max_age_min: int = BMS_SOC_MAX_AGE_MIN
+) -> Optional[float]:
+    """Latest JK BMS SOC as a 0–1 fraction, or ``None``.
+
+    Reads the last ``max_age_min`` minutes of history rather than the live
+    state: HA includes the state at window start, so the last numeric entry is
+    either the current value or — while the helper is ``unavailable`` during a
+    BLE dropout — the last reading no older than the window.
+    """
+    start = (datetime.now(timezone.utc) - timedelta(minutes=max_age_min)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+    url = (
+        f"{base_url}/history/period/{start}?"
+        f"filter_entity_id={BMS_SOC_ENTITY}&minimal_response=true&no_attributes=true"
+    )
+    try:
+        resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+    if not data or not isinstance(data[0], list):
+        return None
+    for entry in reversed(data[0]):
+        try:
+            return max(0.0, min(1.0, float(entry.get("state")) / 100.0))
+        except (ValueError, TypeError):
+            continue  # "unavailable" / "unknown"
+    return None
+
+
+def fetch_initial_soc(base_url: str, token: str) -> tuple[float, str]:
+    """Starting SOC (0–1) and its source: ``bms``, ``voltage`` or ``default``.
+
+    Pack voltage is a poor LiFePO4 SOC proxy — flat curve, inflated while
+    charging (53.2 V maps to 65 % while the BMS reported 20 %) — so it is only
+    used when the BMS has been silent for longer than ``BMS_SOC_MAX_AGE_MIN``.
+    """
+    soc = fetch_bms_soc(base_url, token)
+    if soc is not None:
+        return soc, "bms"
+    voltage = fetch_battery_voltage(base_url, token)
+    if voltage is not None:
+        return voltage_to_soc(voltage), "voltage"
+    return 0.5, "default"
 
 
 # ── Consumption (inverter output) ──────────────────────────────────────────
@@ -726,7 +783,8 @@ def fetch_all_data(
     Returns:
         dict with:
           - prices: list of hourly price dicts (24 or 48 long).
-          - voltage: latest battery voltage (or None).
+          - soc: starting SOC fraction (0–1).
+          - soc_source: 'bms', 'voltage' (BMS silent) or 'default' (0.5).
           - dummy_loads: net load per horizon hour (consumption − solar, ≥ 0).
                          Length matches ``prices``.
           - raw_consumption: gross consumption per horizon hour (weekday-keyed).
@@ -740,7 +798,7 @@ def fetch_all_data(
         overrides = OptimizerOverrides()
 
     prices = fetch_hourly_prices(base_url, token, horizon=horizon)
-    voltage = fetch_battery_voltage(base_url, token)
+    soc, soc_source = fetch_initial_soc(base_url, token)
     consumption = fetch_consumption_by_weekday(base_url, token, days=days)
     solar = fetch_solar_forecast(base_url, token)
 
@@ -761,7 +819,8 @@ def fetch_all_data(
 
     return {
         "prices": prices,
-        "voltage": voltage,
+        "soc": soc,
+        "soc_source": soc_source,
         "dummy_loads": net_load,
         "raw_consumption": raw_consumption,
         "solar_forecast_kwh": solar_per_hour,
