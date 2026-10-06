@@ -31,6 +31,16 @@ CHARGE_STEPS_A = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
 # current 90 A / 52 V (4.68 kW) — lower it to throttle grid charging.
 MAX_CHARGE_POWER_KW = 5.0
 
+# Grid connection: one phase, 25 A breaker. The BleBox on the main feed sees
+# everything behind the Pstryk meter — inverter AC input and the dummy load.
+GRID_LIMIT_KW = 25 * 230 / 1000  # 5.75 kW
+
+# Negative-price dummy load: its own circuit straight from the grid, outside
+# the inverter, switched on whenever the price is < 0. The optimizer only
+# reserves its share of the breaker; its earnings are not modelled (Pstryk AIO
+# shows them). Set to 0 if the dummy circuit is off.
+DUMMY_LOAD_KW = 4.5
+
 # Derived
 TOTAL_CAPACITY_WH = NOMINAL_VOLTAGE * CAPACITY_AH  # ~16640 Wh (V × Ah = Wh)
 USABLE_CAPACITY_WH = TOTAL_CAPACITY_WH * (MAX_SOC - MIN_SOC)

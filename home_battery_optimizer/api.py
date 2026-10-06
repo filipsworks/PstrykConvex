@@ -665,8 +665,8 @@ def _build_net_load(
     solar: dict,
     horizon_dates: list[date],
     overrides: Optional[OptimizerOverrides] = None,
-) -> tuple[list[float], list[float], list[float]]:
-    """Assemble per-horizon-hour (net_load, raw_consumption, solar) lists.
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Assemble per-horizon-hour (net_load, raw_consumption, solar, pv_surplus).
 
     Net load = max(0, consumption[weekday][hour] - solar[date][hour]).
 
@@ -678,10 +678,14 @@ def _build_net_load(
       3. ``solar_override_kwh``   → full PV forecast replacement.
       4. ``solar_scale``          → multiplier on the PV forecast.
       5. (net = max(0, consumption − solar))
-      6. ``extra_loads``          → add planned one-shot loads (kW × duration_h)
+      6. ``extra_loads``          → add planned one-shot loads (kW × duration_h);
+                                     they eat PV surplus first, then net load.
       7. ``load_override_kw``     → final hard replacement of the net load.
 
-    Returns three parallel lists, each ``len(prices)`` long.
+    ``pv_surplus`` = max(0, solar − consumption): what PV has left over for
+    the battery after the house.
+
+    Returns four parallel lists, each ``len(prices)`` long.
     """
     profiles: dict[int, list[float]] = consumption["profiles"]
     overall_hourly: list[float] = consumption["overall_hourly"]
@@ -697,6 +701,8 @@ def _build_net_load(
     net: list[float] = []
     raw: list[float] = []
     sol: list[float] = []
+    surplus: list[float] = []
+    today = datetime.now(WARSAW_TZ).date()
 
     for i, _ in enumerate(prices):
         block_idx = i // 24
@@ -717,10 +723,11 @@ def _build_net_load(
         # REST layer (in which case the field is None).
         cons_kw *= overrides.consumption_adjustment_for(wd, hour)
 
-        # Pick the right solar day. Block 0 = today's solar, block 1 = tomorrow's.
-        if block_idx == 0:
+        # Pick the solar forecast by calendar date, not block index —
+        # horizon='tomorrow' has tomorrow in block 0.
+        if day == today:
             sol_kwh = solar["today"][hour]
-        elif block_idx == 1:
+        elif day == today + timedelta(days=1):
             sol_kwh = solar["tomorrow"][hour]
         else:
             sol_kwh = 0.0
@@ -739,6 +746,7 @@ def _build_net_load(
         raw.append(round(cons_kw, 3))
         sol.append(round(sol_kwh, 3))
         net.append(round(net_kw, 3))
+        surplus.append(round(max(0.0, sol_kwh - cons_kw), 3))
 
     # (6) Extra one-shot loads (additive).
     for load in overrides.extra_loads:
@@ -747,14 +755,16 @@ def _build_net_load(
         for offset in range(load["duration_h"]):
             idx = base + load["hour"] + offset
             if 0 <= idx < len(net):
-                net[idx] = round(net[idx] + load["kw"], 3)
+                from_pv = min(surplus[idx], load["kw"])
+                surplus[idx] = round(surplus[idx] - from_pv, 3)
+                net[idx] = round(net[idx] + load["kw"] - from_pv, 3)
 
     # (7) Final hard load override (replaces net entirely, length-tolerant).
     if overrides.load_override_kw is not None:
         for i in range(min(len(net), len(overrides.load_override_kw))):
             net[i] = round(max(0.0, overrides.load_override_kw[i]), 3)
 
-    return net, raw, sol
+    return net, raw, sol, surplus
 
 
 # ── One-shot fetcher used by main.py / rest_service.py ─────────────────────
@@ -789,6 +799,8 @@ def fetch_all_data(
                          Length matches ``prices``.
           - raw_consumption: gross consumption per horizon hour (weekday-keyed).
           - solar_forecast_kwh: per-horizon-hour solar production (kWh).
+          - pv_surplus_kw: per-horizon-hour PV left over after the house
+                           (≥ 0) — free battery charging.
           - consumption_profiles: full ``{weekday: [24 kW]}`` map.
           - out_of_work_days: list of out-of-work dates (Sat/Sun + PL holidays)
                               covering the horizon.
@@ -813,7 +825,7 @@ def fetch_all_data(
         d.isoformat() for d in h_dates if is_out_of_work(d, holidays)
     ]
 
-    net_load, raw_consumption, solar_per_hour = _build_net_load(
+    net_load, raw_consumption, solar_per_hour, pv_surplus = _build_net_load(
         prices, consumption, solar, h_dates, overrides=overrides
     )
 
@@ -824,6 +836,7 @@ def fetch_all_data(
         "dummy_loads": net_load,
         "raw_consumption": raw_consumption,
         "solar_forecast_kwh": solar_per_hour,
+        "pv_surplus_kw": pv_surplus,
         "consumption_profiles": consumption["profiles"],
         "out_of_work_days": out_of_work_days,
         "horizon_dates": [d.isoformat() for d in h_dates],

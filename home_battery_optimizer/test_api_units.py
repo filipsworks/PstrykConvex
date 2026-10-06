@@ -93,6 +93,20 @@ def main() -> None:
     assert api.fetch_initial_soc("http://x/api", "tok") == (0.5, "default")
     print("  ✓ SOC chain: bms → last bms in window → voltage → default")
 
+    # Net load / PV surplus split, with the solar forecast picked by date:
+    # a 'tomorrow' horizon has tomorrow in block 0 and must use tomorrow's PV.
+    flat = [1.0] * 24
+    consumption = {"profiles": {wd: flat for wd in range(7)}, "overall_hourly": flat}
+    solar = {"today": [0.0] * 24, "tomorrow": [3.0 if 10 <= h < 14 else 0.0 for h in range(24)]}
+    prices = [{"hour": h, "price": 1.0} for h in range(24)]
+    tomorrow = today + timedelta(days=1)
+    overrides = api.OptimizerOverrides(extra_loads=[{"hour": 10, "kw": 0.5, "duration_h": 1}])
+    net, _, _, surplus = api._build_net_load(prices, consumption, solar, [tomorrow], overrides)
+    assert net[12] == 0.0 and surplus[12] == 2.0, (net[12], surplus[12])
+    assert net[9] == 1.0 and surplus[9] == 0.0
+    assert net[10] == 0.0 and surplus[10] == 1.5  # extra load eats PV surplus first
+    print("  ✓ PV surplus split out and taken from tomorrow's forecast")
+
     print("\nAll checks passed.")
 
 

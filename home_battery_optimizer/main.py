@@ -82,7 +82,8 @@ MOCK_DUMMY_LOADS = [
     epilog=(
         "Mode legend:\n"
         "  SUB/SNU — charging battery from grid\n"
-        "  SBU/OSO — discharging battery to loads"
+        "  SBU/OSO — discharging battery to loads\n"
+        "  SUB/OSO — grid powers loads, battery holds"
     ),
 )
 @click.option("--mock", is_flag=True, help="Use sample data instead of API")
@@ -227,7 +228,7 @@ def main(
     )()
 
     # Fetch data (now thread overrides through to the API)
-    prices, dummy_loads, initial_soc, horizon_dates = get_data(args)
+    prices, dummy_loads, initial_soc, horizon_dates, pv_surplus = get_data(args)
 
     # Warn if tomorrow's pricing is estimated (cloned from today)
     if _has_estimated_prices(prices):
@@ -238,10 +239,11 @@ def main(
 
     # Calculate current hour in Europe/Warsaw timezone for live runs.
     # The optimizer cannot make decisions for past hours.
-    # Only "today" has past hours; "tomorrow"/"available" are fully future.
+    # "today" and "available" both start with today; only "tomorrow" is
+    # fully in the future.
     if args.mock:
         start_hour = 0
-    elif args.horizon == "today":
+    elif args.horizon in ("today", "available"):
         now_warsaw = datetime.now(WARSAW_TZ)
         start_hour = now_warsaw.hour
         click.echo(
@@ -250,7 +252,7 @@ def main(
             err=True,
         )
     else:
-        # Tomorrow or available — all hours are in the future
+        # Tomorrow — all hours are in the future
         start_hour = 0
 
     # Run optimization for each day in the horizon
@@ -263,6 +265,8 @@ def main(
         prices = prices[24:]
         if len(dummy_loads) >= 48:
             dummy_loads = dummy_loads[24:]
+        if pv_surplus and len(pv_surplus) >= 48:
+            pv_surplus = pv_surplus[24:]
         n_days = 1
 
     # If we trimmed today out for `--horizon tomorrow`, also trim the date list
@@ -283,6 +287,7 @@ def main(
             day_loads = dummy_loads
         else:
             day_loads = dummy_loads[start:end]
+        day_pv = pv_surplus[start:end] if pv_surplus else None
 
         soc_start = (
             initial_soc
@@ -324,10 +329,13 @@ def main(
                 objective=args.objective,
                 max_soc=day_max_soc,
                 min_soc=day_min_soc,
+                pv_surplus_kw=day_pv,
             )
         except Exception as e:
             click.echo(f"[error] Optimization failed for day {i + 1}: {e}", err=True)
             ctx.exit(1)
+        for w in result["warnings"]:
+            click.echo(f"[warn] Day {i + 1}: {w}", err=True)
 
         # Inject charge_kwh (signed) and day into each decision
         for d in result["decisions"]:
@@ -350,9 +358,9 @@ def main(
     if args.output == "json":
         click.echo(render_json(all_results, overrides=overrides))
     elif args.output == "sensitivity":
-        click.echo(render_sensitivity(prices, dummy_loads, initial_soc))
+        click.echo(render_sensitivity(prices, dummy_loads, initial_soc, pv_surplus))
     elif args.output == "sensitivity-json":
-        render_sensitivity_json(prices, dummy_loads, initial_soc)
+        render_sensitivity_json(prices, dummy_loads, initial_soc, pv_surplus)
     else:
         if overrides.dry_run:
             click.echo("[dry-run] Advisory output — do not push decisions to inverter.", err=True)
@@ -371,7 +379,7 @@ def _build_base_url(ha_url: str) -> str:
 
 
 def get_data(args):
-    """Return (prices, dummy_loads, initial_soc, horizon_dates) for the requested horizon.
+    """Return (prices, dummy_loads, initial_soc, horizon_dates, pv_surplus) for the horizon.
 
     ``args.overrides`` is forwarded to :func:`api.fetch_all_data` so the
     returned ``dummy_loads`` already reflects consumption/solar overrides.
@@ -380,6 +388,7 @@ def get_data(args):
     """
     overrides = getattr(args, "overrides", None)
     horizon_dates: list[str] = []
+    pv_surplus = None  # mock data has no PV
 
     if args.mock:
         click.echo("[mock] Using sample data", err=True)
@@ -424,6 +433,7 @@ def get_data(args):
         else:
             prices = data["prices"]
             dummy_loads = data["dummy_loads"]
+            pv_surplus = data.get("pv_surplus_kw")
             horizon_dates = data.get("horizon_dates") or []
             initial_soc = data["soc"]
             click.echo(
@@ -431,7 +441,7 @@ def get_data(args):
                 err=True,
             )
 
-    return prices, dummy_loads, initial_soc, horizon_dates
+    return prices, dummy_loads, initial_soc, horizon_dates, pv_surplus
 
 
 def _has_estimated_prices(prices: list[dict]) -> bool:
@@ -577,6 +587,9 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
         lines.append(
             "    SBU/OSO — discharging battery to loads             [blue bar]"
         )
+        lines.append(
+            "    SUB/OSO — grid powers loads, battery holds (PV may charge it)"
+        )
         lines.append("")
 
     return "\n".join(lines)
@@ -601,7 +614,8 @@ def render_json(all_results: list[dict], overrides: OptimizerOverrides | None = 
 
 
 def run_sensitivity(
-    prices: list[dict], dummy_loads_kw: list[float], initial_soc: float
+    prices: list[dict], dummy_loads_kw: list[float], initial_soc: float,
+    pv_surplus_kw: list[float] | None = None,
 ) -> dict:
     """Run unconstrained + sensitivity optimization and return results.
 
@@ -613,7 +627,9 @@ def run_sensitivity(
     # First, run unconstrained to find the "natural" optimal SOC
     click.echo("Running unconstrained optimization (baseline)...", err=True)
     try:
-        baseline_result = optimize(prices, dummy_loads_kw, initial_soc, target_soc=None)
+        baseline_result = optimize(
+            prices, dummy_loads_kw, initial_soc, target_soc=None, pv_surplus_kw=pv_surplus_kw
+        )
         baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
         baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
         baseline_cost_per_kwh = (
@@ -643,9 +659,12 @@ def run_sensitivity(
         target_soc = target_pct / 100.0
         try:
             result = optimize(
-                prices, dummy_loads_kw, initial_soc, target_soc=target_soc
+                prices, dummy_loads_kw, initial_soc, target_soc=target_soc,
+                pv_surplus_kw=pv_surplus_kw,
             )
             summary = result["summary"]
+            if not summary["target_reached"]:
+                break  # targets ascend, so every higher one is out of reach too
             total_cost_pln = summary["total_cost_pln"]
             grid_kwh = summary["total_grid_kwh"]
             cost_per_kwh = total_cost_pln / max(grid_kwh, 0.001) if grid_kwh > 0 else 0
@@ -678,9 +697,9 @@ def run_sensitivity(
     }
 
 
-def render_sensitivity(prices, dummy_loads_kw, initial_soc):
+def render_sensitivity(prices, dummy_loads_kw, initial_soc, pv_surplus_kw=None):
     """Render sensitivity analysis as ASCII bar chart."""
-    data = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+    data = run_sensitivity(prices, dummy_loads_kw, initial_soc, pv_surplus_kw)
     baseline = data["baseline"]
     points = data["points"]
 
@@ -744,9 +763,9 @@ def render_sensitivity(prices, dummy_loads_kw, initial_soc):
     return "\n".join(lines)
 
 
-def render_sensitivity_json(prices, dummy_loads_kw, initial_soc):
+def render_sensitivity_json(prices, dummy_loads_kw, initial_soc, pv_surplus_kw=None):
     """Render sensitivity analysis as JSON."""
-    data = run_sensitivity(prices, dummy_loads_kw, initial_soc)
+    data = run_sensitivity(prices, dummy_loads_kw, initial_soc, pv_surplus_kw)
     click.echo(json.dumps(data, indent=2))
 
 

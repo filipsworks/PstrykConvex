@@ -135,6 +135,7 @@ def _get_data(
         "solar_forecast_kwh": None,
         "out_of_work_days": None,
         "horizon_dates": None,
+        "pv_surplus_kw": None,
     }
 
     if mock:
@@ -177,6 +178,7 @@ def _get_data(
                 dummy_loads = data["dummy_loads"]
                 aux["raw_consumption"] = data.get("raw_consumption")
                 aux["solar_forecast_kwh"] = data.get("solar_forecast_kwh")
+                aux["pv_surplus_kw"] = data.get("pv_surplus_kw")
                 aux["out_of_work_days"] = data.get("out_of_work_days")
                 aux["horizon_dates"] = data.get("horizon_dates")
                 initial_soc = data["soc"]
@@ -233,6 +235,7 @@ def _run_optimization(
     objective=OBJECTIVE_MIN_COST,
     max_soc: float = 0.95,
     min_soc: float = 0.10,
+    pv_surplus=None,
 ):
     """Run optimization and return (result, warnings).
 
@@ -243,6 +246,7 @@ def _run_optimization(
         target_soc: Target end-of-day SOC fraction (0–1), or None.
         start_hour: First hour to optimize (past hours are skipped).
         max_soc, min_soc: SOC bounds (fractions).
+        pv_surplus: 24-hour PV surplus over the house load (kW), or None.
 
     Returns:
         (result_dict, warnings_list)
@@ -257,7 +261,7 @@ def _run_optimization(
     result = optimize(
         prices, dummy_loads, initial_soc, target_soc=target_soc,
         start_hour=start_hour, objective=objective,
-        max_soc=max_soc, min_soc=min_soc,
+        max_soc=max_soc, min_soc=min_soc, pv_surplus_kw=pv_surplus,
     )
 
     # Inject charge_kwh (signed) into each decision
@@ -279,6 +283,7 @@ def _run_multi_day_optimization(
     objective=OBJECTIVE_MIN_COST,
     horizon_dates: Optional[list[str]] = None,
     overrides: Optional[OptimizerOverrides] = None,
+    pv_surplus: Optional[list[float]] = None,
 ):
     """Run optimization for multiple days (e.g. today + tomorrow).
 
@@ -322,6 +327,7 @@ def _run_multi_day_optimization(
             day_loads = dummy_loads
         else:
             day_loads = dummy_loads[start:end]
+        day_pv = pv_surplus[start:end] if pv_surplus else None
 
         # First day skips past hours; subsequent days optimize full day
         day_start_hour = start_hour if i == 0 else 0
@@ -351,7 +357,7 @@ def _run_multi_day_optimization(
             result, warnings = _run_optimization(
                 day_prices, day_loads, current_soc, day_target_soc,
                 day_start_hour, objective,
-                max_soc=day_max_soc, min_soc=day_min_soc,
+                max_soc=day_max_soc, min_soc=day_min_soc, pv_surplus=day_pv,
             )
         except Exception as e:
             raise RuntimeError(f"Optimization failed for day {i + 1}: {e}") from e
@@ -372,7 +378,7 @@ def _run_multi_day_optimization(
 
 def _run_sensitivity(
     prices, dummy_loads, initial_soc, start_hour=0,
-    max_soc: float = 0.95, min_soc: float = 0.10,
+    max_soc: float = 0.95, min_soc: float = 0.10, pv_surplus=None,
 ):
     """Run sensitivity analysis: unconstrained baseline + target SOC sweep.
 
@@ -387,7 +393,7 @@ def _run_sensitivity(
         try:
             baseline_result = optimize(
                 prices, dummy_loads, initial_soc, target_soc=None, start_hour=start_hour,
-                max_soc=max_soc, min_soc=min_soc,
+                max_soc=max_soc, min_soc=min_soc, pv_surplus_kw=pv_surplus,
             )
             baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
             baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
@@ -419,8 +425,11 @@ def _run_sensitivity(
                     start_hour=start_hour,
                     max_soc=max_soc,
                     min_soc=min_soc,
+                    pv_surplus_kw=pv_surplus,
                 )
                 summary = result["summary"]
+                if not summary["target_reached"]:
+                    break  # targets ascend, so every higher one is out of reach too
                 total_cost_pln = summary["total_cost_pln"]
                 grid_kwh = summary["total_grid_kwh"]
                 cost_per_kwh = (
@@ -666,8 +675,9 @@ def optimize_endpoint():
     )
 
     # Calculate start_hour: skip past hours for live runs.
-    # Only "today" has past hours; "tomorrow"/"available" are fully future.
-    if mock or horizon != "today":
+    # "today" and "available" both start with today; only "tomorrow" is
+    # fully in the future.
+    if mock or horizon == "tomorrow":
         start_hour = 0
     else:
         now_warsaw = datetime.now(WARSAW_TZ)
@@ -679,6 +689,7 @@ def optimize_endpoint():
             prices, dummy_loads, initial_soc, target_soc, start_hour, objective,
             horizon_dates=aux.get("horizon_dates"),
             overrides=overrides,
+            pv_surplus=aux.get("pv_surplus_kw"),
         )
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
@@ -720,9 +731,9 @@ def optimize_endpoint():
                 **result,
                 "raw_consumption_kw": block_raw,
                 "solar_forecast_kwh": block_solar,
-                "warnings": day_warnings + stderr_log.strip().splitlines()
-                if stderr_log
-                else [],
+                "warnings": day_warnings
+                + result.get("warnings", [])
+                + (stderr_log.strip().splitlines() if stderr_log else []),
                 "advisory": overrides.dry_run,
                 "overrides_active": overrides.summary(),
                 "adjustments": adj_meta,
@@ -789,8 +800,9 @@ def sensitivity_endpoint():
     )
 
     # Calculate start_hour: skip past hours for live runs.
-    # Only "today" has past hours; "tomorrow"/"available" are fully future.
-    if mock or horizon != "today":
+    # "today" and "available" both start with today; only "tomorrow" is
+    # fully in the future.
+    if mock or horizon == "tomorrow":
         start_hour = 0
     else:
         now_warsaw = datetime.now(WARSAW_TZ)
@@ -821,6 +833,7 @@ def sensitivity_endpoint():
         result, stderr_content = _run_sensitivity(
             prices[:24], day_loads, initial_soc, start_hour=start_hour,
             max_soc=day_max_soc, min_soc=day_min_soc,
+            pv_surplus=(aux.get("pv_surplus_kw") or [])[:24] or None,
         )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500

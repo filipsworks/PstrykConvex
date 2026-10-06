@@ -131,8 +131,8 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > 1. `consumption_profile` replaces the auto-learned weekday map.
 > 2. `consumption_scale` multiplies the per-hour kW.
 > 3. `solar_override_kwh` replaces the PV forecast, then `solar_scale` multiplies it.
-> 4. Net load = `max(0, consumption − solar)`.
-> 5. `extra_loads` are added on top.
+> 4. Net load = `max(0, consumption − solar)`; PV surplus = `max(0, solar − consumption)`.
+> 5. `extra_loads` are added on top (they use up PV surplus first).
 > 6. `load_override_kw` hard-replaces the result if supplied.
 
 > **Prediction inputs (live mode):** the optimizer's per-hour load is
@@ -144,6 +144,15 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > Out-of-work days (weekends + PL public holidays scraped from
 > `kalendarzswiat.pl`) are surfaced on each day's response as
 > `is_out_of_work` and influence the weekday-keyed consumption bucket used.
+> The PV surplus (`max(0, solar − consumption)`) charges the battery for free
+> in every mode; whatever does not fit is lost (nothing is exported).
+
+> **Inverter model:** every hour runs in one mode, as the inverter really does
+> it — `SBU/OSO` puts the *whole* house deficit on the battery, `SUB/OSO` keeps
+> the battery idle, `SUB/SNU` charges from the grid in whole 10 A steps. Grid
+> import (house + charging) stays within the 25 A breaker; in negative-price
+> hours the dummy circuit (4.5 kW, outside the inverter) takes its share first
+> (`GRID_LIMIT_KW` / `DUMMY_LOAD_KW` in `battery_model.py`).
 
 **Response:**
 
@@ -191,6 +200,7 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
       "discharge_wh": 0.0,
       "charge_kwh": 0.0,
       "charge_amps": 0,
+      "pv_charge_wh": 0.0,
       "soc_pct": 35.0,
       "grid_cost_pln": 0.6504,
       "total_active_kw": 0.8,
@@ -201,11 +211,14 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
   "summary": {
     "total_charge_wh": 2080.0,
     "total_discharge_wh": 0.0,
+    "total_pv_charge_wh": 0.0,
     "net_energy_wh": 2080.0,
     "cycled_pct": 1.96,
     "total_grid_kwh": 31.758,
     "total_cost_pln": 22.29,
-    "final_soc": 37.0
+    "final_soc": 37.0,
+    "target_reached": true,
+    "grid_over_limit_kwh": 0.0
   }
 }
 ```
@@ -219,14 +232,21 @@ Extra response fields (compared with the pre-overrides version):
 | `max_soc_pct` / `min_soc_pct` | float | SOC bounds actually used for the day (after balance-day promotion, etc.). |
 | `effective_target_soc_pct` | float | Per-date EOD target SOC actually used (only present when one was set). |
 | `overrides_active` | object | Summary of all overrides applied to this run. |
+| `decisions[].pv_charge_wh` / `summary.total_pv_charge_wh` | float | Energy the battery takes from PV surplus (battery side, Wh). `charge_wh` is grid charging only. |
+| `summary.target_reached` | bool \| null | `false` when the EOD target SOC is out of reach (e.g. late in the day); the plan then gets as close as it can and `final_soc` shows how close. `null` = no target. |
+| `summary.grid_over_limit_kwh` | float | House load the breaker cap could not take (negative-price hours with an empty battery leave only 1.25 kW next to the dummy circuit). `0` normally. |
+
+The optimizer never fails as infeasible: the EOD target and the breaker cap are
+soft limits. When one is missed, the response still carries a full plan, the
+flag above and a human-readable line in `warnings`.
 
 **Mode Legend:**
 
 | Mode Pair | Meaning |
 |---|---|
 | `SUB/SNU` | Loads on grid + charge battery from grid (cheap hours) |
-| `SBU/OSO` | Loads on battery, no charging |
-| `SUB/OSO` | Loads on grid, no charging (idle battery) |
+| `SBU/OSO` | Loads on battery, no grid charging (PV surplus still charges) |
+| `SUB/OSO` | Loads on grid, no grid charging (battery idle apart from PV surplus) |
 
 **Examples:**
 
