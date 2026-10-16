@@ -80,10 +80,9 @@ MOCK_DUMMY_LOADS = [
 @click.command(
     context_settings={"max_content_width": 120},
     epilog=(
-        "Mode legend:\n"
-        "  SUB/SNU — charging battery from grid\n"
-        "  SBU/OSO — discharging battery to loads\n"
-        "  SUB/OSO — grid powers loads, battery holds"
+        "Mode legend (offgrid first, no plain bypass):\n"
+        "  SBU/OSO — offgrid: battery + PV power the house (AC off)\n"
+        "  SUB/SNU — AC on: grid powers the house and charges the battery"
     ),
 )
 @click.option("--mock", is_flag=True, help="Use sample data instead of API")
@@ -109,11 +108,11 @@ MOCK_DUMMY_LOADS = [
 @click.option(
     "--days",
     type=int,
-    default=7,
+    default=28,
     show_default=True,
     help=(
         "Days of history to fetch for the weekday×hour consumption "
-        "profile (default: 7, the minimum to cover every weekday)."
+        "profile (default: 28, four samples of every weekday)."
     ),
 )
 @click.option(
@@ -582,13 +581,10 @@ def render_tui(all_results: list[dict], horizon: str = "available") -> str:
         lines.append(sep)
         lines.append("  Mode legend:")
         lines.append(
-            "    SUB/SNU — charging battery from grid              [green bar]"
+            "    SUB/SNU — AC on: grid powers loads, charges battery [green bar]"
         )
         lines.append(
-            "    SBU/OSO — discharging battery to loads             [blue bar]"
-        )
-        lines.append(
-            "    SUB/OSO — grid powers loads, battery holds (PV may charge it)"
+            "    SBU/OSO — offgrid: battery + PV power loads         [blue bar]"
         )
         lines.append("")
 

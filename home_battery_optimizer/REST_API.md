@@ -67,13 +67,17 @@ Health check endpoint.
 The service automatically records every `/optimize` run's per-hour predictions
 (consumption, solar, net load, price) into a local SQLite store at
 `home_battery_optimizer/data/history.db` (override the path with the
-`BATTERY_HISTORY_DB` env var). A nightly `/reconcile` call pulls the
-actuals for the previous day from Home Assistant history, compares them
-against the recorded predictions, and exponentially smooths a learned
-multiplier per `(weekday, hour)` bucket into the `adjustments` table.
+`BATTERY_HISTORY_DB` env var). Every night at 03:00 (Warsaw) the service
+reconciles the previous day by itself: it pulls the actuals from Home
+Assistant, compares them against the recorded predictions, and
+exponentially smooths a learned multiplier per `(weekday, hour)` bucket
+into the `adjustments` table.  It uses `HA_URL` / `HA_TOKEN` from the
+environment when set, otherwise the credentials of the last live
+`/optimize` call (kept in memory only).  `/reconcile` stays available for
+manual runs and back-fills.
 
-Subsequent `/optimize` / `/sensitivity` calls apply those multipliers by
-default — pass `use_adjustments=false` to skip the lookup and get the
+Subsequent `/optimize` / `/sensitivity` calls apply the consumption
+multipliers by default (PV has no learned factor — see *Prediction inputs*) — pass `use_adjustments=false` to skip the lookup and get the
 raw, unadjusted result (e.g. for "what would the unadjusted optimizer do?"
 or A/B comparisons).
 
@@ -104,9 +108,9 @@ Run the charging optimization and return JSON results.
 | `mock` | boolean | `false` | No (unless no token) | Use sample data instead of Home Assistant API |
 | `ha_url` | string | `https://ha.kompfix.pl` | No | Home Assistant base URL (without `/api`) |
 | `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
-| `horizon` | enum | `available` | No | Which day's prices to optimize: `today`, `tomorrow`, or `available` |
-| `days` | integer | `7` | No | Days of history to fetch for the weekday×hour consumption profile (≥7 ensures every weekday is represented) |
-| `target_soc` | float | *(none)* | No | Global EOD SOC % (0–100). If omitted or `-1`, optimizer chooses freely. Beaten by `per_date_target_soc` for matching dates. |
+| `horizon` | enum | `available` | No | Which prices to plan over: `today`, `tomorrow`, or `available` (today + tomorrow once published, padded with **estimated** hours — the last known day repeated — to at least 36 h ahead). Every hour is solved as **one** plan. |
+| `days` | integer | `28` | No | Days of load history for the weekday×hour profile (28 = four samples of every weekday) |
+| `target_soc` | float | `-1` | No | EOD SOC % (0–100), a floor at the end of every day with published prices. `-1` or omitted = **automatic**: the cheapest plan that never lets the SOC drop below `min_soc_pct` over the whole horizon. Beaten by `per_date_target_soc` for matching dates. |
 | `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
 | `use_adjustments` | boolean | `true` | No | When `false`, skip the learned `(weekday, hour)` multipliers from `/reconcile` history — i.e. run the optimizer on the raw learned profile without any reality-driven correction. Same flag is supported on `/sensitivity`. |
 
@@ -136,23 +140,35 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > 6. `load_override_kw` hard-replaces the result if supplied.
 
 > **Prediction inputs (live mode):** the optimizer's per-hour load is
-> `max(0, consumption[weekday][hour] − solar_forecast[hour])` where
-> consumption comes from a median per `(weekday, hour-of-day)` over the last
-> `days` of `sensor.inverter_e50000254944442369_dessmonitor_output_power` (inverter total AC output, reported in W and scaled to kW),
-> and the solar forecast is read from
-> `sensor.dom_energy_production_today` / `…_tomorrow` (`wh_period` attr).
-> Out-of-work days (weekends + PL public holidays scraped from
-> `kalendarzswiat.pl`) are surfaced on each day's response as
-> `is_out_of_work` and influence the weekday-keyed consumption bucket used.
+> `max(0, consumption[weekday][hour] − solar_forecast[hour])`.
+>
+> *Consumption* comes from the hourly **means** in HA's long-term statistics
+> (WebSocket `recorder/statistics_during_period`) of
+> `sensor.inverter_e50000254944442369_dessmonitor_output_power` (W → kW):
+> 0.5 × (same weekday & hour over the last `days`) + 0.5 × (same hour over the last 7 days).
+> PL public holidays (scraped from `kalendarzswiat.pl`) count as Sundays, in
+> the history and in the plan; each day's response carries `is_out_of_work`.
+>
+> *PV* is the Open-Meteo forecast `sensor.dom_energy_production_today` /
+> `…_tomorrow` / `…_d2` (`wh_period` attr), used as is — no fixed factor.
+> On every call the rest of **today** is scaled by measured/forecast yield
+> over today's finished hours (`sensor.…_dessmonitor_energy_today` and
+> `sensor.jk_bms_soc` statistics; hours with the pack ≥ 98 % are skipped
+> because a full pack curtails PV; 1.0 until 0.5 kWh of forecast has been
+> judged; clamped 0.25–2.0). The factor is in `pv_correction_today`.
 > The PV surplus (`max(0, solar − consumption)`) charges the battery for free
-> in every mode; whatever does not fit is lost (nothing is exported).
+> in every mode; whatever does not fit is curtailed (`pv_lost_kwh`) — this is
+> not a prosumer site, nothing is exported.
 
-> **Inverter model:** every hour runs in one mode, as the inverter really does
-> it — `SBU/OSO` puts the *whole* house deficit on the battery, `SUB/OSO` keeps
-> the battery idle, `SUB/SNU` charges from the grid in whole 10 A steps. Grid
-> import (house + charging) stays within the 25 A breaker; in negative-price
-> hours the dummy circuit (4.5 kW, outside the inverter) takes its share first
-> (`GRID_LIMIT_KW` / `DUMMY_LOAD_KW` in `battery_model.py`).
+> **Inverter model — offgrid first, two modes only:** every hour is either
+> `SBU/OSO` (offgrid: AC breaker off, the battery covers the *whole* house
+> deficit, PV surplus charges it) or `SUB/SNU` (AC on: the grid powers the
+> house and charges in whole 10 A steps, 10–80 A). A grid hour always
+> charges — there is no plain bypass (`SUB/OSO`). With equal cost the plan
+> stays offgrid. Grid import (house + charging) stays within the 25 A
+> breaker; in negative-price hours the dummy circuit (4.5 kW, outside the
+> inverter) takes its share first (`GRID_LIMIT_KW` / `DUMMY_LOAD_KW` in
+> `battery_model.py`).
 
 **Response:**
 
@@ -191,21 +207,28 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
     "per_date_target_soc": {"2026-05-19": 80},
     "dry_run": false
   },
+  "pv_correction_today": 0.82,
   "decisions": [
     {
       "hour": 0,
+      "start": "2026-05-19T00:00:00+02:00",
+      "mode": "charge",
+      "ac_on": true,
       "output_mode": "SUB",
-      "charger_mode": "OSO",
-      "charge_wh": 0.0,
+      "charger_mode": "SNU",
+      "charge_wh": 1040.0,
       "discharge_wh": 0.0,
-      "charge_kwh": 0.0,
-      "charge_amps": 0,
+      "charge_kwh": 1.04,
+      "charge_amps": 20,
       "pv_charge_wh": 0.0,
-      "soc_pct": 35.0,
-      "grid_cost_pln": 0.6504,
-      "total_active_kw": 0.8,
-      "total_cost_pln": 0.6504,
-      "price_plkwh": 0.813
+      "pv_lost_kwh": 0.0,
+      "soc_pct": 41.3,
+      "grid_kwh": 1.895,
+      "grid_cost_pln": 1.5406,
+      "total_active_kw": 1.895,
+      "total_cost_pln": 1.5406,
+      "price_plkwh": 0.813,
+      "is_estimated": false
     }
   ],
   "summary": {
@@ -216,12 +239,57 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
     "cycled_pct": 1.96,
     "total_grid_kwh": 31.758,
     "total_cost_pln": 22.29,
+    "total_pv_lost_kwh": 0.0,
+    "ac_hours": 2,
     "final_soc": 37.0,
+    "min_soc": 12.4,
     "target_reached": true,
     "grid_over_limit_kwh": 0.0
+  },
+  "plan": { "...": "see below" }
+}
+```
+
+With more than one day (the usual case for `horizon=available`) the response
+is `{"days": [<one object like the above per calendar day>], "plan": {...},
+"advisory": ..., "adjustments": ...}` — today, tomorrow and, when the
+horizon is padded, a partial day of estimated hours (`is_estimated: true`).
+All days come from one joint solve.
+
+**`plan`** — what to do with the AC breaker and the inverter, over the whole horizon:
+
+```json
+"plan": {
+  "generated_at": "2026-10-16T17:10:29+02:00",
+  "target_soc": "auto",
+  "min_soc_pct": 10.0,
+  "now": {
+    "start": "2026-10-16T17:00:00+02:00", "mode": "offgrid", "ac_on": false,
+    "output_mode": "SBU", "charger_mode": "OSO", "charge_amps": 0,
+    "soc_pct": 96.4, "price_plkwh": 2.0314
+  },
+  "next_change": {"at": "2026-10-17T02:00:00+02:00", "mode": "charge", "ac_on": true, "charge_amps": 40},
+  "ac_windows": [
+    {"start": "2026-10-17T02:00:00+02:00", "end": "2026-10-17T05:00:00+02:00",
+     "max_amps": 40, "grid_kwh": 7.1, "cost_pln": 7.3, "avg_price_plkwh": 1.03,
+     "soc_from_pct": 22.0, "soc_to_pct": 58.5, "is_estimated": false}
+  ],
+  "totals": {
+    "grid_kwh": 7.1, "cost_pln": 7.3, "pv_lost_kwh": 1.2, "ac_hours": 3,
+    "min_soc_pct": 21.0, "min_soc_at": "2026-10-17T02:00:00+02:00",
+    "final_soc_pct": 44.0, "horizon_end": "2026-10-18T05:00:00+02:00",
+    "estimated_prices_from": "2026-10-18T00:00:00+02:00"
   }
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `now` | The current hour: inverter modes to set, whether the AC breaker must be on, amps. |
+| `next_change` | First later hour whose mode differs (`null` = none in the horizon). |
+| `ac_windows` | Consecutive charging hours merged: when to switch the AC breaker on/off, the highest current, energy and cost from the grid, SOC before/after. `is_estimated` = based on not-yet-published prices. |
+| `totals.pv_lost_kwh` | PV the full battery could not take (curtailed — nothing is exported). |
+| `totals.min_soc_pct` / `min_soc_at` | Lowest SOC in the plan and when (end of that hour). |
 
 Extra response fields (compared with the pre-overrides version):
 
@@ -233,6 +301,12 @@ Extra response fields (compared with the pre-overrides version):
 | `effective_target_soc_pct` | float | Per-date EOD target SOC actually used (only present when one was set). |
 | `overrides_active` | object | Summary of all overrides applied to this run. |
 | `decisions[].pv_charge_wh` / `summary.total_pv_charge_wh` | float | Energy the battery takes from PV surplus (battery side, Wh). `charge_wh` is grid charging only. |
+| `decisions[].mode` / `ac_on` | str / bool | `offgrid` (AC off) or `charge` (AC on). |
+| `decisions[].start` | str | Local start of the hour (ISO 8601). |
+| `decisions[].grid_kwh` | float | Energy from the grid that hour (house + charging); 0 offgrid. |
+| `decisions[].pv_lost_kwh` / `summary.total_pv_lost_kwh` | float | PV surplus the battery can't take — curtailed, never exported. |
+| `decisions[].is_estimated` | bool | Price of that hour not published yet (estimated tail). |
+| `pv_correction_today` | float | Measured/forecast PV over today's finished hours, applied to the rest of today. |
 | `summary.target_reached` | bool \| null | `false` when the EOD target SOC is out of reach (e.g. late in the day); the plan then gets as close as it can and `final_soc` shows how close. `null` = no target. |
 | `summary.grid_over_limit_kwh` | float | House load the breaker cap could not take (negative-price hours with an empty battery leave only 1.25 kW next to the dummy circuit). `0` normally. |
 
@@ -244,9 +318,8 @@ flag above and a human-readable line in `warnings`.
 
 | Mode Pair | Meaning |
 |---|---|
-| `SUB/SNU` | Loads on grid + charge battery from grid (cheap hours) |
-| `SBU/OSO` | Loads on battery, no grid charging (PV surplus still charges) |
-| `SUB/OSO` | Loads on grid, no grid charging (battery idle apart from PV surplus) |
+| `SBU/OSO` | `mode: offgrid`, `ac_on: false` — loads on battery + PV, AC breaker off |
+| `SUB/SNU` | `mode: charge`, `ac_on: true` — loads on grid + charge battery from grid at `charge_amps` |
 
 **Examples:**
 
@@ -301,7 +374,7 @@ Run sensitivity analysis: grid cost vs target SOC across the active SOC band (`m
 | `ha_url` | string | `https://ha.kompfix.pl` | Home Assistant base URL |
 | `ha_token` | string | *(none)* | HA token (required if `mock=false`) |
 | `horizon` | enum | `available` | Which day's prices: `today`, `tomorrow`, `available` |
-| `days` | integer | `7` | Days of history for load estimation |
+| `days` | integer | `28` | Days of load history for the profile |
 
 The response includes `max_soc_pct` / `min_soc_pct` (the bounds the sweep was clamped to) and `overrides_active`, so a dashboard can show why the sweep range moved (e.g. balance day → 100%).
 
@@ -441,10 +514,8 @@ divide-by-zero blow-ups.
 `*_bias = mean(actual/predicted) - 1` — positive means actuals exceeded
 predictions on average (you're using more than the optimizer expects).
 
-**Suggested cron** (call from your scheduler at ~03:00 daily):
-```
-0 3 * * * curl -X POST "http://localhost:8000/reconcile?ha_token=$HA_TOKEN"
-```
+The service runs this for yesterday by itself every night at 03:00 (see
+*Prediction-vs-reality feedback loop*); call it by hand only to back-fill.
 
 ---
 

@@ -63,12 +63,13 @@ class OptimizerOverrides:
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
 
-    # Adjustments learned from past prediction-vs-reality reconciliation.
-    # Keys are (weekday, hour); values are multipliers ≥ 0.  Default 1.0
-    # when a bucket is absent.  These are NOT user-supplied — the REST
-    # layer populates them from history_db when ``use_adjustments=true``.
+    # Consumption multipliers learned from past prediction-vs-reality
+    # reconciliation.  Keys are (weekday, hour); values are multipliers ≥ 0.
+    # Default 1.0 when a bucket is absent.  These are NOT user-supplied — the
+    # REST layer populates them from history_db when ``use_adjustments=true``.
+    # PV has no learned factor: the plan aims at the forecast and corrects the
+    # rest of today from measured yield (api.pv_correction).
     consumption_adjustment: Optional[dict[tuple[int, int], float]] = None
-    solar_adjustment: Optional[dict[tuple[int, int], float]] = None
 
     # ── Resolution helpers ─────────────────────────────────────────────────
 
@@ -114,22 +115,12 @@ class OptimizerOverrides:
                 if self.consumption_adjustment is not None
                 else 0
             ),
-            "solar_adjustment_buckets": (
-                len(self.solar_adjustment)
-                if self.solar_adjustment is not None
-                else 0
-            ),
         }
 
     def consumption_adjustment_for(self, weekday: int, hour: int) -> float:
         if self.consumption_adjustment is None:
             return 1.0
         return self.consumption_adjustment.get((weekday, hour), 1.0)
-
-    def solar_adjustment_for(self, weekday: int, hour: int) -> float:
-        if self.solar_adjustment is None:
-            return 1.0
-        return self.solar_adjustment.get((weekday, hour), 1.0)
 
 
 # ── Parsers (CLI / REST friendly) ──────────────────────────────────────────

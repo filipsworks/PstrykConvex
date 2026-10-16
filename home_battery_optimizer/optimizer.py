@@ -14,6 +14,7 @@ from battery_model import (
     MAX_CHARGE_CURRENT_A,
     MAX_CHARGE_POWER_KW,
     MAX_SOC,
+    MAX_TOTAL_CHARGE_CURRENT_A,
     MIN_SOC,
     NOMINAL_VOLTAGE,
     TOTAL_CAPACITY_WH,
@@ -24,9 +25,9 @@ OBJECTIVE_MIN_COST = "min_cost"
 OBJECTIVE_MIN_COST_PER_KWH = "min_cost_per_kwh"
 VALID_OBJECTIVES = (OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH)
 
-# Tie-breakers, far below any real price difference: without a deficit to
-# cover SBU and SUB/OSO are equivalent (prefer SUB/OSO), and PV surplus goes
-# into the battery as soon as it appears, like the inverter does.
+# Tie-breakers, far below any real price difference: offgrid wins every hour
+# it costs nothing extra, and PV surplus goes into the battery as soon as it
+# appears, like the inverter does.
 _EPS = 1e-4
 
 # PLN per kWh of a soft limit missed — far above any real price, so the solver
@@ -37,42 +38,70 @@ _PENALTY = 1000.0
 MIP_TIME_LIMIT_S = 3
 
 
+def _summarize(decisions: list[dict], over_kwh: float, target_reached) -> dict:
+    """Totals over a run of hourly decisions (whole horizon or one day)."""
+    charge_wh = sum(d["charge_wh"] for d in decisions)
+    discharge_wh = sum(d["discharge_wh"] for d in decisions)
+    return {
+        "total_charge_wh": round(charge_wh, 1),
+        "total_discharge_wh": round(discharge_wh, 1),
+        "total_pv_charge_wh": round(sum(d["pv_charge_wh"] for d in decisions), 1),
+        "net_energy_wh": round(charge_wh - discharge_wh, 1),
+        "cycled_pct": round(discharge_wh / TOTAL_CAPACITY_WH * 100, 2),
+        "total_grid_kwh": round(sum(d["grid_kwh"] for d in decisions), 3),
+        "total_cost_pln": round(sum(d["grid_cost_pln"] for d in decisions), 4),
+        "total_pv_lost_kwh": round(sum(d["pv_lost_kwh"] for d in decisions), 3),
+        "ac_hours": sum(1 for d in decisions if d["ac_on"]),
+        "final_soc": decisions[-1]["soc_pct"] if decisions else None,
+        "min_soc": min(d["soc_pct"] for d in decisions) if decisions else None,
+        # None = no target for this span.
+        "target_reached": target_reached,
+        "grid_over_limit_kwh": round(over_kwh, 3),
+    }
+
+
 def _build_and_solve(
     prices: list[dict],
     dummy_loads_kw: list[float],
     initial_soc: float,
     target_soc: float = None,
     start_hour: int = 0,
-    max_soc: float = MAX_SOC,
+    max_soc=MAX_SOC,
     min_soc: float = MIN_SOC,
     pv_surplus_kw: list[float] | None = None,
+    day_targets: dict[int, float] | None = None,
 ) -> dict:
-    """Core MILP: minimise grid cost for hours [start_hour, 24).
+    """Core MILP: minimise grid cost for hours [start_hour, len(prices)).
+
+    The horizon is one block of any length — the rest of today, tomorrow once
+    its prices are out, and estimated hours after that — solved jointly, so
+    today's plan already knows what tomorrow needs.  Index 0 is 00:00 of the
+    first day.
 
     ``dummy_loads_kw`` is the house load behind the inverter left after PV
     (``max(0, consumption − PV)``) — despite the historical name it is NOT
     the negative-price dummy circuit.  ``pv_surplus_kw`` is the opposite side
     (``max(0, PV − consumption)``): it charges the battery for free; whatever
-    does not fit is lost, nothing is exported.
+    does not fit is curtailed (``pv_lost_kwh``) — nothing is exported.
 
-    Every hour runs in exactly one inverter mode, modelled the way the
-    inverter behaves rather than as free power flows:
+    Offgrid has priority and there is no plain bypass: every hour runs in one
+    of two modes, modelled the way the inverter behaves:
 
-      SBU/OSO  battery covers the WHOLE house deficit
-      SUB/OSO  grid covers the deficit, battery holds (PV may still charge it)
-      SUB/SNU  grid covers the deficit and charges at k × 10 A
+      SBU/OSO  offgrid — battery covers the WHOLE house deficit (AC off)
+      SUB/SNU  AC on — grid covers the deficit and charges at k × 10 A, k ≥ 1
 
     Grid import (house deficit + charging) shares the 25 A breaker with the
     dummy circuit, which runs whenever the price is negative.  Negative
     prices need no other special case: charging and grid supply earn money
     then, so the solver fills the most negative hours first on its own.
 
-    ``max_soc`` and ``min_soc`` are fractions (0–1).  They override the
-    module-level :data:`MAX_SOC` / :data:`MIN_SOC` defaults so the caller can
-    schedule e.g. monthly full-charge balance days (``max_soc=1.0``) without
-    touching the rest of the code.
+    ``max_soc`` is a fraction or a per-hour list (e.g. 1.0 on a monthly
+    balance day); ``min_soc`` is the reserve the SOC never drops below.
+    ``target_soc`` pins the SOC at the horizon end; ``day_targets`` maps a
+    day index ``b`` to the SOC at its end (hour ``(b + 1) * 24``) when that
+    boundary is inside the horizon.  Both are soft.
     """
-    HOURS = 24
+    HOURS = len(prices)
     n = HOURS - start_hour
     capacity_kwh = TOTAL_CAPACITY_WH / 1000
     eta_ch = CHARGE_EFFICIENCY
@@ -80,7 +109,7 @@ def _build_and_solve(
     step_a = CHARGE_STEPS_A[1]
     step_kw = step_a * NOMINAL_VOLTAGE / 1000  # battery-side kW per charge step
     k_max = MAX_CHARGE_CURRENT_A // step_a
-    max_batt_in_kw = MAX_CHARGE_CURRENT_A * NOMINAL_VOLTAGE / 1000  # PV + grid
+    max_batt_in_kw = MAX_TOTAL_CHARGE_CURRENT_A * NOMINAL_VOLTAGE / 1000  # PV + grid
     max_discharge_kw = NOMINAL_VOLTAGE * CAPACITY_AH / 1000 * 0.5
 
     price = np.array([p["price"] for p in prices[start_hour:HOURS]], dtype=float)
@@ -92,9 +121,25 @@ def _build_and_solve(
     )
     grid_cap = GRID_LIMIT_KW - np.where(price < 0, DUMMY_LOAD_KW, 0.0)
 
+    # SOC already outside [min, max] (PV tops the pack up to 100 %, the BMS may
+    # read below MinSOC) must not make the problem infeasible.
+    soc_lo = min(min_soc, initial_soc)
+    soc_hi = np.maximum(np.broadcast_to(np.asarray(max_soc, dtype=float), (HOURS,))[start_hour:], initial_soc)
+
+    # Soft SOC floors at hour boundaries: {hours from start: SOC fraction}.
+    # Whole 10 A steps can't land exactly on MaxSOC without crossing it, so a
+    # target at the ceiling means "full to within one charge step".
+    targets: dict[int, float] = {}
+    if target_soc is not None:
+        targets[n] = target_soc
+    for b, tgt in (day_targets or {}).items():
+        t = (b + 1) * 24 - start_hour
+        if 0 < t <= n:
+            targets[t] = max(tgt, targets.get(t, 0.0))
+    targets = {t: min(v, soc_hi[t - 1] - step_kw / capacity_kwh) for t, v in sorted(targets.items())}
+
     # --- Variables ---
-    sbu = cp.Variable(n, boolean=True)   # battery powers the house
-    snu = cp.Variable(n, boolean=True)   # grid charges the battery
+    sbu = cp.Variable(n, boolean=True)   # 1 = offgrid, 0 = AC on and charging
     k = cp.Variable(n, integer=True)     # grid charge current in steps of step_a
     pv_in = cp.Variable(n, nonneg=True)  # kW of PV surplus taken by the battery
     soc = cp.Variable(n + 1)             # SOC fraction at each hour boundary
@@ -103,22 +148,13 @@ def _build_and_solve(
     grid_load = cp.multiply(deficit, 1 - sbu)              # grid → house kW
     discharge = cp.multiply(deficit / eta_dis, sbu)        # battery-side kW
 
-    # SOC already outside [min, max] (PV tops the pack up to 100 %, the BMS may
-    # read below MinSOC) must not make the problem infeasible.
-    soc_lo = min(min_soc, initial_soc)
-    soc_hi = max(max_soc, initial_soc)
-
-    if target_soc is not None:
-        # Whole 10 A steps can't land exactly on MaxSOC without crossing it,
-        # so a target at the ceiling means "full to within one charge step".
-        target_soc = min(target_soc, soc_hi - step_kw / capacity_kwh)
-
-    # The breaker cap and the EOD target are soft: a plan always exists (hold
-    # the battery, house on the grid), so the solver never reports infeasible.
-    # The house alone can exceed what negative-price hours leave next to the
-    # dummy circuit, and late in the day a target may be out of reach.
+    # The breaker cap and the SOC targets are soft: a plan always exists, so
+    # the solver never reports infeasible.  The house alone can exceed what
+    # negative-price hours leave next to the dummy circuit, and late in the
+    # day a target may be out of reach.
     over = cp.Variable(n, nonneg=True)   # kW of grid import over the breaker cap
-    short = cp.Variable(nonneg=True)     # EOD SOC missing to the target
+    # SOC missing to each target (cvxpy has no 0-size variables; a spare one stays 0).
+    short = cp.Variable(max(1, len(targets)), nonneg=True)
 
     constraints = [
         soc[0] == initial_soc,
@@ -126,9 +162,9 @@ def _build_and_solve(
         + (k * step_kw + eta_ch * pv_in - discharge) / capacity_kwh,
         soc[1:] >= soc_lo,
         soc[1:] <= soc_hi,
-        sbu + snu <= 1,
-        k >= snu,
-        k <= k_max * snu,
+        # AC on only to charge: a grid hour always takes at least one step.
+        k >= 1 - sbu,
+        k <= k_max * (1 - sbu),
         pv_in <= surplus,
         k * step_kw + eta_ch * pv_in <= max_batt_in_kw,
         discharge <= max_discharge_kw,
@@ -137,9 +173,9 @@ def _build_and_solve(
         # still trip the breaker; lower GRID_LIMIT_KW if that happens.
         grid_load + grid_charge <= grid_cap + over,
     ]
-    if target_soc is not None:
-        constraints.append(soc[n] + short >= target_soc)
-        print(f"  → EOD target SOC ≥ {target_soc * 100:.0f}%", file=sys.stderr)
+    for i, (t, tgt) in enumerate(targets.items()):
+        constraints.append(soc[t] + short[i] >= tgt)
+        print(f"  → SOC ≥ {tgt * 100:.0f}% after {t} h", file=sys.stderr)
 
     # Earlier PV intake scores higher, so the battery takes PV as soon as it
     # comes. ponytail: the solver may still skip morning PV to leave room for
@@ -147,8 +183,8 @@ def _build_and_solve(
     # needs a "battery full" binary per hour if that ever shows up in a plan.
     pv_weight = _EPS * np.arange(n, 0, -1) / n
     objective = cp.Minimize(
-        price @ (grid_load + grid_charge) + _EPS * cp.sum(sbu) - pv_weight @ pv_in
-        + _PENALTY * (cp.sum(over) + short * capacity_kwh)
+        price @ (grid_load + grid_charge) - _EPS * cp.sum(sbu) - pv_weight @ pv_in
+        + _PENALTY * (cp.sum(over) + cp.sum(short) * capacity_kwh)
     )
 
     problem = cp.Problem(objective, constraints)
@@ -165,86 +201,81 @@ def _build_and_solve(
 
     # --- Build results ---
     decisions = []
-    total_charge_wh = 0.0
-    total_discharge_wh = 0.0
-    total_pv_charge_wh = 0.0
-    total_grid_kwh = 0.0
-    total_cost_pln = 0.0
-
     for t in range(n):
         h = start_hour + t
         is_sbu = round(float(sbu.value[t])) == 1
-        steps = int(round(float(k.value[t])))
-        charge_amps = steps * step_a
+        steps = 0 if is_sbu else int(round(float(k.value[t])))
         pv_kw = max(0.0, float(pv_in.value[t]))
 
         charge_wh = round(steps * step_kw * 1000, 2)
         discharge_wh = round(deficit[t] / eta_dis * 1000, 2) if is_sbu else 0.0
-        pv_charge_wh = round(eta_ch * pv_kw * 1000, 2)
         gl_kw = 0.0 if is_sbu else deficit[t]
         gc_kw = steps * step_kw / eta_ch
         grid_cost = price[t] * (gl_kw + gc_kw)
-
-        total_charge_wh += charge_wh
-        total_discharge_wh += discharge_wh
-        total_pv_charge_wh += pv_charge_wh
-        total_grid_kwh += gl_kw + gc_kw
-        total_cost_pln += grid_cost
-
-        if is_sbu:
-            output_mode, charger_mode = "SBU", "OSO"
-        elif steps > 0:
-            output_mode, charger_mode = "SUB", "SNU"
-        else:
-            output_mode, charger_mode = "SUB", "OSO"
-
         total_active_kw = deficit[t] + gc_kw
 
         decisions.append(
             {
-                "hour": h,
-                "output_mode": output_mode,
-                "charger_mode": charger_mode,
+                "hour": h % 24,
+                # offgrid = AC breaker off, battery + PV; charge = AC on.
+                "mode": "offgrid" if is_sbu else "charge",
+                "ac_on": not is_sbu,
+                "output_mode": "SBU" if is_sbu else "SUB",
+                "charger_mode": "OSO" if is_sbu else "SNU",
                 "charge_wh": charge_wh,
                 "discharge_wh": discharge_wh,
-                "pv_charge_wh": pv_charge_wh,
-                "charge_amps": charge_amps,
+                "pv_charge_wh": round(eta_ch * pv_kw * 1000, 2),
+                # PV the battery can't take; curtailed, never exported.
+                "pv_lost_kwh": round(max(0.0, surplus[t] - pv_kw), 3),
+                "charge_amps": steps * step_a,
                 "soc_pct": round(float(soc.value[t + 1]) * 100, 1),
+                "grid_kwh": round(gl_kw + gc_kw, 3),
                 "grid_cost_pln": round(grid_cost, 4),
                 "total_active_kw": round(total_active_kw, 3),
                 "total_cost_pln": round(price[t] * total_active_kw, 4),
                 "price_plkwh": float(price[t]),
+                "is_estimated": bool(prices[h].get("is_estimated", False)),
             }
         )
 
-    summary = {
-        "total_charge_wh": round(total_charge_wh, 1),
-        "total_discharge_wh": round(total_discharge_wh, 1),
-        "total_pv_charge_wh": round(total_pv_charge_wh, 1),
-        "net_energy_wh": round(total_charge_wh - total_discharge_wh, 1),
-        "cycled_pct": round((total_discharge_wh / TOTAL_CAPACITY_WH) * 100, 2),
-        "total_grid_kwh": round(total_grid_kwh, 3),
-        "total_cost_pln": round(total_cost_pln, 4),
-        "final_soc": round(float(soc.value[n]) * 100, 1),
-        # None = no target set.
-        "target_reached": None if target_soc is None else float(short.value) < 1e-3,
-        "grid_over_limit_kwh": round(float(np.sum(over.value)), 3),
-    }
+    over_kwh = np.maximum(over.value, 0.0)
+    reached = {t: float(short.value[i]) < 1e-3 for i, t in enumerate(targets)}
+
+    # One block per calendar day (block 0 = the day of index 0).
+    blocks = []
+    for b in range(start_hour // 24, (HOURS - 1) // 24 + 1):
+        ts = [t for t in range(n) if (start_hour + t) // 24 == b]
+        if not ts:
+            continue
+        end_t = ts[-1] + 1
+        blocks.append(
+            {
+                "decisions": decisions[ts[0]:end_t],
+                "summary": _summarize(
+                    decisions[ts[0]:end_t], float(over_kwh[ts].sum()), reached.get(end_t)
+                ),
+            }
+        )
+
+    summary = _summarize(
+        decisions, float(over_kwh.sum()), all(reached.values()) if reached else None
+    )
 
     warnings = []
-    if summary["target_reached"] is False:
-        warnings.append(
-            f"Target SOC {target_soc * 100:.0f}% unreachable — "
-            f"best possible is {summary['final_soc']:.0f}%"
-        )
-    over_hours = [start_hour + t for t in range(n) if over.value[t] > 1e-3]
+    for t, ok in reached.items():
+        if not ok:
+            warnings.append(
+                f"Target SOC {targets[t] * 100:.0f}% unreachable — "
+                f"best possible is {float(soc.value[t]) * 100:.0f}%"
+            )
+    over_hours = [start_hour + t for t in range(n) if over_kwh[t] > 1e-3]
     if over_hours:
         warnings.append(
-            f"House load exceeds the breaker cap in hours {over_hours} "
+            f"House load exceeds the breaker cap in horizon hours {over_hours} "
             f"({summary['grid_over_limit_kwh']} kWh over)"
         )
 
-    return {"decisions": decisions, "summary": summary, "warnings": warnings}
+    return {"decisions": decisions, "summary": summary, "warnings": warnings, "blocks": blocks}
 
 
 def _find_min_cost_per_kwh_target_soc(
@@ -270,7 +301,7 @@ def _find_min_cost_per_kwh_target_soc(
     best_target_soc: float | None = None
     best_cost_per_kwh = float("inf")
 
-    soc_levels_pct = list(range(int(min_soc * 100), int(max_soc * 100) + 1, step_pct))
+    soc_levels_pct = list(range(int(min_soc * 100), int(np.max(max_soc) * 100) + 1, step_pct))
     print(
         f"  [min_cost_per_kwh] Sweeping {len(soc_levels_pct)} SOC targets "
         f"({soc_levels_pct[0]}%–{soc_levels_pct[-1]}%, step {step_pct}%)…",
@@ -326,9 +357,10 @@ def optimize(
     target_soc: float = None,
     start_hour: int = 0,
     objective: str = OBJECTIVE_MIN_COST,
-    max_soc: float = MAX_SOC,
+    max_soc=MAX_SOC,
     min_soc: float = MIN_SOC,
     pv_surplus_kw: list[float] | None = None,
+    day_targets: dict[int, float] | None = None,
 ) -> dict:
     """Run the CVXPY optimisation and return results.
 
@@ -350,24 +382,27 @@ def optimize(
     the 25 A breaker leaves next to the dummy circuit.
 
     Args:
-        prices: 24 hourly price dicts with 'hour', 'price' keys.
-        dummy_loads_kw: 24-hour house load behind the inverter left after PV
-                        (kW, ≥ 0). Not the negative-price dummy circuit.
+        prices: hourly price dicts with 'hour', 'price' keys (and optional
+                'is_estimated'); 24 for one day, more for a joint horizon.
+        dummy_loads_kw: house load behind the inverter left after PV, one
+                        per price (kW, ≥ 0). Not the negative-price dummy circuit.
         initial_soc: SOC at start_hour (0–1).
-        target_soc: Optional EOD SOC floor (0–1). Ignored for
+        target_soc: Optional SOC floor at the horizon end (0–1). Ignored for
                     min_cost_per_kwh (the sweep determines it).
-        start_hour: First hour to optimise (default 0 = full day).
+        start_hour: First index to optimise (past hours of day 0 skipped).
         objective: 'min_cost' or 'min_cost_per_kwh'.
-        max_soc: Upper SOC bound (0–1). Pass 1.0 for a scheduled monthly
-                 balance / full-charge day. Defaults to :data:`MAX_SOC`.
-        min_soc: Lower SOC bound (0–1). Defaults to :data:`MIN_SOC`.
-        pv_surplus_kw: 24-hour PV surplus over the house load (kW, ≥ 0).
+        max_soc: Upper SOC bound (0–1), or one per price. Pass 1.0 for a
+                 scheduled monthly balance / full-charge day. Defaults to :data:`MAX_SOC`.
+        min_soc: Reserve the SOC stays above (0–1). Defaults to :data:`MIN_SOC`.
+        pv_surplus_kw: PV surplus over the house load, one per price (kW, ≥ 0).
                        Charges the battery for free. None = no PV.
+        day_targets: {day index: SOC floor at the end of that day}.
 
     Returns:
         dict with keys:
-          - decisions: list of hourly dicts for hours [start_hour, 24)
-          - summary: daily totals
+          - decisions: list of hourly dicts for indices [start_hour, len(prices))
+          - blocks: the same decisions split per calendar day, each with a summary
+          - summary: horizon totals
           - objective: which mode was used
           - chosen_target_soc_pct: (min_cost_per_kwh only) SOC% chosen by sweep
           - chosen_cost_per_kwh: (min_cost_per_kwh only) PLN/kWh at chosen SOC
@@ -377,7 +412,7 @@ def optimize(
             f"Unknown objective '{objective}'. Valid: {VALID_OBJECTIVES}"
         )
 
-    if not (0.0 <= min_soc < max_soc <= 1.0):
+    if not (0.0 <= min_soc < np.min(max_soc) and np.max(max_soc) <= 1.0):
         raise ValueError(
             f"Invalid SOC bounds: min_soc={min_soc}, max_soc={max_soc} "
             "(require 0 ≤ min < max ≤ 1)."
@@ -399,10 +434,11 @@ def optimize(
         max_soc=max_soc,
         min_soc=min_soc,
         pv_surplus_kw=pv_surplus_kw,
+        day_targets=day_targets,
     )
 
     result["objective"] = objective
-    result["max_soc_pct"] = round(max_soc * 100, 1)
+    result["max_soc_pct"] = round(float(np.max(max_soc)) * 100, 1)
     result["min_soc_pct"] = round(min_soc * 100, 1)
     if objective == OBJECTIVE_MIN_COST_PER_KWH:
         result["chosen_target_soc_pct"] = (

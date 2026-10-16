@@ -3,7 +3,8 @@
 # Pack specs (16s LiFePo4 — 2026-09 upgrade from 8s/24 V, cell count doubled
 # in series so pack voltage doubled while Ah stayed the same → 2× energy)
 NOMINAL_VOLTAGE = 52.0  # V — nominal pack voltage
-MAX_CHARGE_CURRENT_A = 90  # A — absolute max charge current
+MAX_CHARGE_CURRENT_A = 80  # A — grid (AC) charge ceiling, the inverter's "Max ładowanie AC"
+MAX_TOTAL_CHARGE_CURRENT_A = 150  # A — PV + grid together, the inverter's "Max ładowanie Σ"
 CAPACITY_AH = 320  # Ah — cell capacity
 
 # SOC bounds (DoD limits to prolong life)
@@ -23,12 +24,12 @@ CHARGE_EFFICIENCY = 0.95  # BMS + wiring losses during charge
 DISCHARGE_EFFICIENCY = 0.95  # inverter losses during discharge
 ROUND_TRIP_EFFICIENCY = CHARGE_EFFICIENCY * DISCHARGE_EFFICIENCY
 
-# Discrete charging steps: 10A-90A in 10A increments (minimum practical charge).
+# Discrete charging steps: 10A-80A in 10A increments (minimum practical charge).
 # Written to number.…_maximum_mains_charging_current (accepts 5–120 A).
-CHARGE_STEPS_A = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+CHARGE_STEPS_A = [0, 10, 20, 30, 40, 50, 60, 70, 80]
 
 # Ceiling on grid→battery power used by the optimizer. Non-binding at the
-# current 90 A / 52 V (4.68 kW) — lower it to throttle grid charging.
+# current 80 A / 52 V (4.16 kW) — lower it to throttle grid charging.
 MAX_CHARGE_POWER_KW = 5.0
 
 # Grid connection: one phase, 25 A breaker. The BleBox on the main feed sees

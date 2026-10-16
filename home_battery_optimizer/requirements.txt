@@ -5,3 +5,4 @@ flask>=3.0.0
 requests>=2.31.0
 starlette>=0.37.0
 uvicorn[standard]>=0.29.0
+websockets>=12.0

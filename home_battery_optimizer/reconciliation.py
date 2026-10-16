@@ -11,13 +11,14 @@ Ratios are clamped to a sane range (default 0.5 – 2.0) so a one-off spike
 doesn't poison the multiplier; near-zero predictions are skipped to avoid
 explosive divisions.
 
-The same mechanism applies to solar — if the predicted PV was 4 kWh and we
-actually got 3, the solar multiplier nudges toward 0.75 so future runs
-plan with the corrected forecast.
+The same mechanism tracks solar (MAPE, bias and a ``solar_multiplier``),
+but only for reporting: the planner aims at the PV forecast and corrects
+the rest of the current day from measured yield instead (``api.pv_correction``).
 
 After reconciliation, ``adjustments`` rows exist for every bucket we ever
 had a sample for (1.0 means "no correction needed"); the optimizer reads
-them on every run unless the caller passes ``use_adjustments=false``.
+the consumption multipliers on every run unless the caller passes
+``use_adjustments=false``.  The REST service runs this nightly at 03:00.
 """
 
 from __future__ import annotations

@@ -1,12 +1,15 @@
 """Home Assistant API client for prices, battery state, dummy loads,
 solar forecast, and Polish out-of-work days."""
 
+import json
 import re
 import statistics
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import requests
+from websockets.sync.client import connect as ws_connect
 
 from battery_model import voltage_to_soc
 from overrides import OptimizerOverrides
@@ -30,26 +33,31 @@ INVERTER_OUTPUT_POWER_ENTITY = (
 # DessMonitor reports output power in W; the whole optimizer works in kW.
 INVERTER_OUTPUT_POWER_TO_KW = 0.001
 
-# Consumption-profile sources as (entity_id, factor-to-kW). The retired
-# "Solar of Things" sensor reported kW and stopped updating 2026-09-06; it is
-# kept only so the weekday profile has a full 7 days of history during the
-# changeover. HA's recorder keeps ~10 days, so it goes silent on its own.
-# ponytail: drop the legacy entry once the new sensor has 7 days of history
-# (from ~2026-09-14) — until then the profile would be a flat 1.5 kW fallback.
-CONSUMPTION_SOURCES = (
-    (INVERTER_OUTPUT_POWER_ENTITY, INVERTER_OUTPUT_POWER_TO_KW),
-    ("sensor.gniazdo_output_active_power", 1.0),
-)
+# Lifetime PV yield counter (kWh, total_increasing): measured production for
+# the prediction-vs-reality reconciliation.
+PV_ENERGY_TOTAL_ENTITY = "sensor.inverter_e50000254944442369_dessmonitor_energy_total"
 
 # JK BMS (template helpers over sensor.jk_bms). The helper goes "unavailable"
 # once sensor.jk_bms has been silent for 60 s (BLE dropouts of ~8 min seen).
 BMS_SOC_ENTITY = "sensor.jk_bms_soc"
-# Oldest BMS SOC reading still trusted over the voltage estimate. At 90 A the
+# Oldest BMS SOC reading still trusted over the voltage estimate. At 80 A the
 # pack moves ~1 % every 2 min, so 15 min bounds the error to roughly 7 %.
 BMS_SOC_MAX_AGE_MIN = 15
 
 SOLAR_FORECAST_TODAY_ENTITY = "sensor.dom_energy_production_today"
 SOLAR_FORECAST_TOMORROW_ENTITY = "sensor.dom_energy_production_tomorrow"
+SOLAR_FORECAST_D2_ENTITY = "sensor.dom_energy_production_d2"
+# PV made per hour (hourly "change" of the daily counter) and the BMS SOC,
+# for the intraday forecast correction.
+PV_ENERGY_TODAY_ENTITY = "sensor.inverter_e50000254944442369_dessmonitor_energy_today"
+
+# The "available" horizon is padded with estimated prices (the last known
+# day, hour by hour) to at least this many hours from now, so a plan made
+# before tomorrow's prices are out still keeps power on through tomorrow.
+MIN_HORIZON_H = 36
+# Hours whose BMS SOC peaked at or above this are skipped by the PV
+# correction: a full pack curtails PV, so the counter under-reads.
+PV_CURTAILED_SOC_PCT = 98
 
 
 # In-process cache for the Polish holiday scrape (one HTTP call per year per run).
@@ -239,113 +247,118 @@ def fetch_initial_soc(base_url: str, token: str) -> tuple[float, str]:
 # ── Consumption (inverter output) ──────────────────────────────────────────
 
 
+def fetch_statistics(
+    base_url: str,
+    token: str,
+    statistic_ids: list[str],
+    start: datetime,
+    end: datetime,
+    types: tuple[str, ...] = ("mean",),
+    period: str = "hour",
+) -> dict[str, list[dict]]:
+    """Long-term statistics through HA's WebSocket API (REST has none).
+
+    Unlike ``/history`` (raw states, ~10 days) these hourly rows are kept
+    forever.  Returns ``{statistic_id: [row]}``; each row's ``start`` is a
+    naive Warsaw-local datetime.
+    """
+    url = re.sub(r"^http", "ws", base_url.rstrip("/")) + "/websocket"
+    with ws_connect(url, open_timeout=15, close_timeout=5, max_size=2**25) as ws:
+        ws.recv(timeout=15)  # auth_required
+        ws.send(json.dumps({"type": "auth", "access_token": token}))
+        if json.loads(ws.recv(timeout=15)).get("type") != "auth_ok":
+            raise RuntimeError("HA websocket auth failed")
+        ws.send(json.dumps({
+            "id": 1,
+            "type": "recorder/statistics_during_period",
+            "start_time": start.astimezone(timezone.utc).isoformat(),
+            "end_time": end.astimezone(timezone.utc).isoformat(),
+            "statistic_ids": statistic_ids,
+            "period": period,
+            "types": list(types),
+        }))
+        msg = json.loads(ws.recv(timeout=60))
+    if not msg.get("success"):
+        raise RuntimeError(f"statistics_during_period failed: {msg.get('error')}")
+    out: dict[str, list[dict]] = {}
+    for sid, rows in (msg.get("result") or {}).items():
+        for r in rows:
+            st = r["start"]
+            t = (
+                datetime.fromtimestamp(st / 1000, timezone.utc)
+                if isinstance(st, (int, float))
+                else datetime.fromisoformat(st)
+            )
+            r["start"] = t.astimezone(WARSAW_TZ).replace(tzinfo=None)
+        out[sid] = rows
+    return out
+
+
+def day_type(day: date, holidays: set[str]) -> int:
+    """Weekday bucket for the load profile: a public holiday counts as Sunday."""
+    return 6 if day.isoformat() in holidays else day.weekday()
+
+
 def fetch_consumption_by_weekday(
-    base_url: str, token: str, days: int = 7
+    base_url: str, token: str, days: int = 28, holidays: set[str] = frozenset()
 ) -> dict:
-    """Fetch inverter output power and bucket it by (weekday, hour-of-day).
+    """Hourly load profile per weekday from the inverter output statistics.
 
-    Sources: :data:`CONSUMPTION_SOURCES` — the DessMonitor inverter total AC
-    output (W, scaled to kW here) plus, during the changeover, the retired
-    ``sensor.gniazdo_output_active_power`` (already kW). Per-hour median is
-    computed per weekday over the past ``days`` of history so that workdays and
-    weekends end up with distinct profiles.
+    Each ``(weekday, hour)`` value blends two hourly means (energy, not a
+    median of samples, so short heavy loads count):
 
-    Args:
-        base_url: HA API base URL.
-        token: Long-lived access token.
-        days: How many days of history to sample (default 7 so every weekday
-              gets at least one observation).
+      0.5 × the same weekday and hour over the past ``days`` (4 weeks = 4 samples)
+    + 0.5 × the same hour over the last 7 days (the recent trend / season)
+
+    Public holidays are bucketed as Sundays, here and in :func:`_build_net_load`.
 
     Returns:
         dict with:
-          - profiles: ``{weekday(0..6): [24 floats]}`` — kW per hour, weekday is
-            Monday=0..Sunday=6 (Python `datetime.weekday()`).
-          - overall_hourly: ``[24 floats]`` — per-hour median across *all*
-            sampled days (used as fallback when a (weekday, hour) bucket is
-            empty).
-          - overall_median: float — single median over every reading (last
-            fallback if even ``overall_hourly[h]`` is missing).
+          - profiles: ``{weekday(0..6): [24 kW]}``, Monday=0.
+          - overall_hourly: ``[24 kW]`` — the last-7-days hourly mean (fallback).
+          - overall_median: float — median of every hourly mean (last fallback).
     """
-    end_dt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    start_dt = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z"
-    )
-
-    url = (
-        f"{base_url}/history/period/{start_dt}?"
-        f"end_time={end_dt}&"
-        f"filter_entity_id={','.join(e for e, _ in CONSUMPTION_SOURCES)}"
-        f"&minimal_response=true"
-    )
-    resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
-    if resp.status_code != 200:
+    now = datetime.now(WARSAW_TZ)
+    try:
+        rows = fetch_statistics(
+            base_url, token, [INVERTER_OUTPUT_POWER_ENTITY], now - timedelta(days=days), now
+        ).get(INVERTER_OUTPUT_POWER_ENTITY, [])
+    except Exception:
         return _empty_consumption_profile()
 
-    data = resp.json()
-
-    # Bucket by (weekday, hour-of-day) in Warsaw local time.
-    by_wd_hr: dict[tuple[int, int], list[float]] = {
-        (wd, h): [] for wd in range(7) for h in range(24)
-    }
-    by_hour: dict[int, list[float]] = {h: [] for h in range(24)}
-    all_values: list[float] = []
-
-    scale_by_entity = dict(CONSUMPTION_SOURCES)
-
-    for entity_data in data:
-        if not isinstance(entity_data, list) or not entity_data:
+    week_ago = now.replace(tzinfo=None) - timedelta(days=7)
+    by_wd_hr: dict[tuple[int, int], list[float]] = defaultdict(list)
+    recent: dict[int, list[float]] = defaultdict(list)
+    by_hour: dict[int, list[float]] = defaultdict(list)
+    for r in rows:
+        if r.get("mean") is None:
             continue
-        # With minimal_response only the first entry carries entity_id.
-        scale = scale_by_entity.get(entity_data[0].get("entity_id", ""), 1.0)
-        for entry in entity_data:
-            state = entry.get("state")
-            if state in ("unavailable", "unknown"):
-                continue
-            try:
-                value = float(state) * scale
-            except (ValueError, TypeError):
-                continue
+        t, kw = r["start"], r["mean"] * INVERTER_OUTPUT_POWER_TO_KW
+        by_wd_hr[(day_type(t.date(), holidays), t.hour)].append(kw)
+        by_hour[t.hour].append(kw)
+        if t >= week_ago:
+            recent[t.hour].append(kw)
 
-            all_values.append(value)
-
-            ts = entry.get("last_changed", "")
-            try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                local = dt.astimezone(WARSAW_TZ)
-                wd = local.weekday()
-                hr = local.hour
-                if 0 <= hr < 24 and 0 <= wd < 7:
-                    by_wd_hr[(wd, hr)].append(value)
-                    by_hour[hr].append(value)
-            except (ValueError, TypeError):
-                continue
-
-    if not all_values:
+    if not by_hour:
         return _empty_consumption_profile()
 
-    overall_median = statistics.median(all_values)
-
-    overall_hourly = []
-    for h in range(24):
-        if by_hour[h]:
-            overall_hourly.append(round(statistics.median(by_hour[h]), 3))
-        else:
-            overall_hourly.append(round(overall_median, 3))
-
-    profiles: dict[int, list[float]] = {}
-    for wd in range(7):
-        row = []
-        for h in range(24):
-            samples = by_wd_hr[(wd, h)]
-            if samples:
-                row.append(round(statistics.median(samples), 3))
-            else:
-                row.append(overall_hourly[h])
-        profiles[wd] = row
-
+    overall_median = statistics.median(v for vs in by_hour.values() for v in vs)
+    overall_hourly = [
+        statistics.mean(recent[h] or by_hour[h]) if (recent[h] or by_hour[h]) else overall_median
+        for h in range(24)
+    ]
+    profiles = {
+        wd: [
+            round(0.5 * statistics.mean(by_wd_hr[(wd, h)]) + 0.5 * overall_hourly[h], 3)
+            if by_wd_hr[(wd, h)]
+            else round(overall_hourly[h], 3)
+            for h in range(24)
+        ]
+        for wd in range(7)
+    }
     return {
         "profiles": profiles,
-        "overall_hourly": overall_hourly,
+        "overall_hourly": [round(v, 3) for v in overall_hourly],
         "overall_median": round(overall_median, 3),
     }
 
@@ -362,100 +375,45 @@ def _empty_consumption_profile() -> dict:
 # ── Reality fetchers (for prediction-vs-reality reconciliation) ────────────
 
 
-def _bucket_history_by_local_hour(
-    data: list,
-    target_date: date,
-) -> list[list[float]]:
-    """Group HA history entries into 24 local-hour buckets for ``target_date``.
-
-    ``data`` is the parsed JSON returned by ``/api/history/period`` for a
-    single entity (i.e. ``data[0]`` of the HA payload).  Entries outside the
-    requested calendar date (Warsaw local) are silently dropped.
-    """
-    buckets: list[list[float]] = [[] for _ in range(24)]
-    target_iso = target_date.isoformat()
-    for entry in data:
-        state = entry.get("state")
-        if state in ("unavailable", "unknown"):
-            continue
-        try:
-            value = float(state)
-        except (ValueError, TypeError):
-            continue
-        ts = entry.get("last_changed", "")
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            local = dt.astimezone(WARSAW_TZ)
-            if local.date().isoformat() != target_iso:
-                continue
-            buckets[local.hour].append(value)
-        except (ValueError, TypeError):
-            continue
-    return buckets
-
-
-def _median_or_none(values: list[float]) -> Optional[float]:
-    if not values:
-        return None
-    return round(statistics.median(values), 3)
-
-
 def fetch_actual_consumption_for_date(
     base_url: str, token: str, target_date: date
 ) -> list[Optional[float]]:
-    """Per-hour median of inverter output power (kW) on a given local date.
+    """Per-hour mean inverter output power (kW) on a given local date.
 
-    Returns a 24-slot list (``None`` where no data was recorded that hour).
+    From the long-term statistics — the same hourly means the profile is
+    built from, so reconciliation compares like with like.  Returns a 24-slot
+    list (``None`` where no data was recorded that hour).
     """
     start_local = datetime.combine(target_date, datetime.min.time(), WARSAW_TZ)
-    end_local = start_local + timedelta(days=1)
-
-    start_iso = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    end_iso = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    url = (
-        f"{base_url}/history/period/{start_iso}?"
-        f"end_time={end_iso}&"
-        f"filter_entity_id={INVERTER_OUTPUT_POWER_ENTITY}&minimal_response=true"
-    )
     try:
-        resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        rows = fetch_statistics(
+            base_url, token, [INVERTER_OUTPUT_POWER_ENTITY], start_local, start_local + timedelta(days=1)
+        ).get(INVERTER_OUTPUT_POWER_ENTITY, [])
     except Exception:
         return [None] * 24
-
-    if not data or not isinstance(data, list) or not isinstance(data[0], list):
-        return [None] * 24
-
-    buckets = _bucket_history_by_local_hour(data[0], target_date)
-    # Sensor reports W; the optimizer works in kW.
-    return [
-        _median_or_none([v * INVERTER_OUTPUT_POWER_TO_KW for v in b]) for b in buckets
-    ]
+    out: list[Optional[float]] = [None] * 24
+    for r in rows:
+        if r.get("mean") is not None and r["start"].date() == target_date:
+            out[r["start"].hour] = round(r["mean"] * INVERTER_OUTPUT_POWER_TO_KW, 3)
+    return out
 
 
 def fetch_actual_solar_for_date(
-    base_url: str,
-    token: str,
-    target_date: date,
-    sensor_entity: str = SOLAR_FORECAST_TODAY_ENTITY,
+    base_url: str, token: str, target_date: date
 ) -> list[Optional[float]]:
-    """Per-hour realised solar kWh on ``target_date``.
+    """Per-hour measured PV yield (kWh) on ``target_date`` (Warsaw local).
 
-    Strategy:
-      1. Read the configurable ``sensor_entity`` history (default is the
-         forecast sensor, whose ``wh_period`` attribute is updated over the
-         day with measured production for the past hours).  We pull the
-         last snapshot whose ``last_changed`` falls on the next day and use
-         its ``wh_period`` map — by then the measurements for ``target_date``
-         are final.
-      2. If that fails, fall back to ``None``-filled list so the caller can
-         skip solar reconciliation for the day.
+    Steps of the inverter's lifetime PV counter (:data:`PV_ENERGY_TOTAL_ENTITY`),
+    each booked to the local hour the counter moved in.  HA records only
+    changes and the counter ticks every 0.01 kWh, so that is the hour the
+    energy was made.  A drop below 90 % of the last reading is a counter reset
+    (HA's ``total_increasing`` rule) and counts up from zero; a smaller dip is
+    noise and is skipped.
+
+    Returns 24 floats, or ``[None] * 24`` when the counter did not move that
+    day (no data rather than a dark day).
     """
-    # Window: the day after target_date in Warsaw — the sensor will have
-    # finalised yesterday's wh_period numbers by 00:00–06:00 local time.
-    start_local = datetime.combine(target_date + timedelta(days=1), datetime.min.time(), WARSAW_TZ)
+    start_local = datetime.combine(target_date, datetime.min.time(), WARSAW_TZ)
     end_local = start_local + timedelta(days=1)
     start_iso = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     end_iso = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -463,7 +421,7 @@ def fetch_actual_solar_for_date(
     url = (
         f"{base_url}/history/period/{start_iso}?"
         f"end_time={end_iso}&"
-        f"filter_entity_id={sensor_entity}"
+        f"filter_entity_id={PV_ENERGY_TOTAL_ENTITY}&minimal_response=true&no_attributes=true"
     )
     try:
         resp = requests.get(url, headers=_get_headers(base_url, token), timeout=30)
@@ -475,45 +433,33 @@ def fetch_actual_solar_for_date(
     if not data or not isinstance(data, list) or not isinstance(data[0], list):
         return [None] * 24
 
-    target_iso = target_date.isoformat()
-    hourly_wh = [0.0] * 24
-    found_any = False
-    # Look at every snapshot in the window; later snapshots overwrite earlier
-    # so the final value reflects the most authoritative wh_period for the
-    # target date's hours.
+    hourly_kwh = [0.0] * 24
+    prev: Optional[float] = None
     for entry in data[0]:
-        wh_period = entry.get("attributes", {}).get("wh_period", {}) if isinstance(entry, dict) else {}
-        if not wh_period:
-            continue
-        rebuilt = [0.0] * 24
-        matched = False
-        for ts_str, wh in wh_period.items():
-            try:
-                dt = datetime.fromisoformat(ts_str)
-                local = dt.astimezone(WARSAW_TZ) if dt.tzinfo else dt
-                if local.date().isoformat() != target_iso:
-                    continue
-                hr = local.hour
-                if 0 <= hr < 24:
-                    rebuilt[hr] += float(wh)
-                    matched = True
-            except (ValueError, TypeError):
+        try:
+            value = float(entry.get("state"))
+            ts = datetime.fromisoformat(entry["last_changed"].replace("Z", "+00:00"))
+        except (ValueError, TypeError, KeyError):
+            continue  # "unavailable" / "unknown"
+        if prev is not None:
+            if value >= prev:
+                step = value - prev
+            elif value < 0.9 * prev:  # counter reset
+                step = value
+            else:  # small dip: noise, keep the last good reading
                 continue
-        if matched:
-            hourly_wh = rebuilt
-            found_any = True
+            hourly_kwh[ts.astimezone(WARSAW_TZ).hour] += step
+        prev = value
 
-    if not found_any:
+    if not any(hourly_kwh):
         return [None] * 24
-
-    return [round(v / 1000.0, 4) for v in hourly_wh]
+    return [round(v, 3) for v in hourly_kwh]
 
 
 def fetch_actuals_for_date(
     base_url: str,
     token: str,
     target_date: date,
-    solar_sensor: str = SOLAR_FORECAST_TODAY_ENTITY,
 ) -> dict:
     """One-stop call: return per-hour actual consumption + solar for a date.
 
@@ -525,7 +471,7 @@ def fetch_actuals_for_date(
         }
     """
     cons = fetch_actual_consumption_for_date(base_url, token, target_date)
-    sol = fetch_actual_solar_for_date(base_url, token, target_date, solar_sensor)
+    sol = fetch_actual_solar_for_date(base_url, token, target_date)
     net: list[Optional[float]] = []
     for c, s in zip(cons, sol):
         if c is None:
@@ -565,18 +511,20 @@ def fetch_solar_forecast(
 ) -> dict:
     """Fetch per-hour solar production forecast for today and tomorrow.
 
-    Sources:
-      - ``sensor.dom_energy_production_today``    (attribute ``wh_period``)
-      - ``sensor.dom_energy_production_tomorrow`` (attribute ``wh_period``)
+    Sources (attribute ``wh_period`` of each):
+      - ``sensor.dom_energy_production_today``
+      - ``sensor.dom_energy_production_tomorrow``
+      - ``sensor.dom_energy_production_d2`` (day after tomorrow)
 
     Returns:
-        dict with ``today`` and ``tomorrow`` keys, each a 24-element list of
-        kWh per Warsaw local hour. Missing sensors yield a zero-filled day.
+        dict with ``today``, ``tomorrow`` and ``d2`` keys, each a 24-element
+        list of kWh per Warsaw local hour. Missing sensors yield a zero-filled day.
     """
-    out = {"today": [0.0] * 24, "tomorrow": [0.0] * 24}
+    out = {"today": [0.0] * 24, "tomorrow": [0.0] * 24, "d2": [0.0] * 24}
     for key, entity in (
         ("today", SOLAR_FORECAST_TODAY_ENTITY),
         ("tomorrow", SOLAR_FORECAST_TOMORROW_ENTITY),
+        ("d2", SOLAR_FORECAST_D2_ENTITY),
     ):
         try:
             url = f"{base_url}/states/{entity}"
@@ -590,6 +538,48 @@ def fetch_solar_forecast(
             # Leave the zero-filled fallback in place.
             pass
     return out
+
+
+def pv_correction(
+    forecast: list[float],
+    actual: list[Optional[float]],
+    soc_max: list[Optional[float]],
+    now_hour: int,
+) -> float:
+    """Measured/forecast PV over today's finished hours, for the rest of today.
+
+    Hours a full pack curtailed PV (BMS SOC ≥ :data:`PV_CURTAILED_SOC_PCT`)
+    are skipped — the counter under-reads there.  Stays 1.0 (aim at the
+    forecast) until the counted hours were forecast to make 0.5 kWh;
+    clamped to 0.25–2.0 so one odd hour can't swing the plan.
+    """
+    f = a = 0.0
+    for h in range(now_hour):
+        if actual[h] is None or forecast[h] < 0.05 or (soc_max[h] or 0) >= PV_CURTAILED_SOC_PCT:
+            continue
+        f += forecast[h]
+        a += actual[h]
+    return 1.0 if f < 0.5 else round(min(2.0, max(0.25, a / f)), 3)
+
+
+def fetch_pv_correction(base_url: str, token: str, forecast_today: list[float]) -> float:
+    """:func:`pv_correction` from today's hourly PV yield and BMS SOC statistics."""
+    now = datetime.now(WARSAW_TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        st = fetch_statistics(
+            base_url, token, [PV_ENERGY_TODAY_ENTITY, BMS_SOC_ENTITY], midnight, now, ("change", "max")
+        )
+    except Exception:
+        return 1.0
+    actual: list[Optional[float]] = [None] * 24
+    soc_max: list[Optional[float]] = [None] * 24
+    for r in st.get(PV_ENERGY_TODAY_ENTITY, []):
+        if r.get("change") is not None:
+            actual[r["start"].hour] = max(0.0, r["change"])
+    for r in st.get(BMS_SOC_ENTITY, []):
+        soc_max[r["start"].hour] = r.get("max")
+    return pv_correction(forecast_today, actual, soc_max, now.hour)
 
 
 # ── Out-of-work days (Polish public holidays + weekends) ───────────────────
@@ -648,7 +638,7 @@ def _horizon_dates(horizon: str, prices: list[dict]) -> list[date]:
     to *every* hour inside that 24-hour block.
     """
     today = datetime.now(WARSAW_TZ).date()
-    n_blocks = max(1, len(prices) // 24)
+    n_blocks = max(1, -(-len(prices) // 24))  # a padded tail may end mid-day
 
     if horizon == "today":
         return [today]
@@ -659,12 +649,23 @@ def _horizon_dates(horizon: str, prices: list[dict]) -> list[date]:
     return [today + timedelta(days=i) for i in range(n_blocks)]
 
 
+def _pad_with_estimates(prices: list[dict], n: int) -> list[dict]:
+    """Pad ``prices`` (whole days) to ``n`` hours by repeating the last known
+    day hour by hour, flagged ``is_estimated``."""
+    last = prices[-24:]
+    return prices + [
+        {**last[i % 24], "is_estimated": True, "is_cheap": False, "is_expensive": False}
+        for i in range(len(prices), n)
+    ]
+
+
 def _build_net_load(
     prices: list[dict],
     consumption: dict,
     solar: dict,
     horizon_dates: list[date],
     overrides: Optional[OptimizerOverrides] = None,
+    holidays: set[str] = frozenset(),
 ) -> tuple[list[float], list[float], list[float], list[float]]:
     """Assemble per-horizon-hour (net_load, raw_consumption, solar, pv_surplus).
 
@@ -713,7 +714,7 @@ def _build_net_load(
             else horizon_dates[-1]
         )
 
-        wd = day.weekday()
+        wd = day_type(day, holidays)
         cons_kw = profiles.get(wd, overall_hourly)[hour]
         # (2) Consumption scale.
         cons_kw *= overrides.consumption_scale
@@ -725,20 +726,14 @@ def _build_net_load(
 
         # Pick the solar forecast by calendar date, not block index —
         # horizon='tomorrow' has tomorrow in block 0.
-        if day == today:
-            sol_kwh = solar["today"][hour]
-        elif day == today + timedelta(days=1):
-            sol_kwh = solar["tomorrow"][hour]
-        else:
-            sol_kwh = 0.0
+        key = {0: "today", 1: "tomorrow", 2: "d2"}.get((day - today).days)
+        sol_kwh = solar.get(key, [0.0] * 24)[hour] if key else 0.0
 
         # (3) Solar override per horizon hour.
         if overrides.solar_override_kwh is not None and i < len(overrides.solar_override_kwh):
             sol_kwh = overrides.solar_override_kwh[i]
         # (4) Solar scale (correction factor).
         sol_kwh *= overrides.solar_scale
-        # (4b) Learned per-(weekday, hour) solar multiplier.
-        sol_kwh *= overrides.solar_adjustment_for(wd, hour)
 
         # (5) 1-hour buckets, so kWh ≈ kW for the purposes of subtraction.
         net_kw = max(0.0, cons_kw - sol_kwh)
@@ -773,7 +768,7 @@ def _build_net_load(
 def fetch_all_data(
     base_url: str,
     token: str,
-    days: int = 7,
+    days: int = 28,
     horizon: str = "available",
     overrides: Optional[OptimizerOverrides] = None,
 ) -> dict:
@@ -783,8 +778,9 @@ def fetch_all_data(
         base_url: HA API base URL (e.g. https://ha.kompfix.pl/api).
         token: Long-lived access token.
         days: Days of history for the weekday × hour consumption profile
-              (default 7 — ensures every weekday is represented at least once).
-        horizon: 'today', 'tomorrow', or 'available'.
+              (default 28 — four samples of every weekday).
+        horizon: 'today', 'tomorrow', or 'available'.  'available' is padded
+                 with estimated prices to :data:`MIN_HORIZON_H` hours ahead.
         overrides: Optional :class:`OptimizerOverrides` applied to the
                    consumption profile, PV forecast, and net load.  When
                    omitted, default (no-op) overrides are used so callers
@@ -792,7 +788,9 @@ def fetch_all_data(
 
     Returns:
         dict with:
-          - prices: list of hourly price dicts (24 or 48 long).
+          - prices: list of hourly price dicts (24, 48, or padded with
+                    ``is_estimated`` hours).
+          - pv_correction: measured/forecast PV ratio applied to the rest of today.
           - soc: starting SOC fraction (0–1).
           - soc_source: 'bms', 'voltage' (BMS silent) or 'default' (0.5).
           - dummy_loads: net load per horizon hour (consumption − solar, ≥ 0).
@@ -809,24 +807,31 @@ def fetch_all_data(
     if overrides is None:
         overrides = OptimizerOverrides()
 
+    now = datetime.now(WARSAW_TZ)
     prices = fetch_hourly_prices(base_url, token, horizon=horizon)
+    if horizon == "available" and prices:
+        prices = _pad_with_estimates(prices, now.hour + MIN_HORIZON_H)
     soc, soc_source = fetch_initial_soc(base_url, token)
-    consumption = fetch_consumption_by_weekday(base_url, token, days=days)
-    solar = fetch_solar_forecast(base_url, token)
 
     h_dates = _horizon_dates(horizon, prices)
 
-    # Holiday set for every year touched by the horizon (typically 1, rarely 2).
+    # Holiday set for every year touched by the horizon and the profile history.
     holidays: set[str] = set()
-    for d in h_dates:
-        holidays |= fetch_holidays_pl(d.year)
+    for year in {d.year for d in h_dates} | {(now - timedelta(days=days)).year}:
+        holidays |= fetch_holidays_pl(year)
+
+    consumption = fetch_consumption_by_weekday(base_url, token, days=days, holidays=holidays)
+    solar = fetch_solar_forecast(base_url, token)
+    # Aim at the forecast; only the rest of today follows what PV really did so far.
+    pv_corr = fetch_pv_correction(base_url, token, solar["today"])
+    solar["today"] = [v * pv_corr if h >= now.hour else v for h, v in enumerate(solar["today"])]
 
     out_of_work_days = [
         d.isoformat() for d in h_dates if is_out_of_work(d, holidays)
     ]
 
     net_load, raw_consumption, solar_per_hour, pv_surplus = _build_net_load(
-        prices, consumption, solar, h_dates, overrides=overrides
+        prices, consumption, solar, h_dates, overrides=overrides, holidays=holidays
     )
 
     return {
@@ -837,6 +842,7 @@ def fetch_all_data(
         "raw_consumption": raw_consumption,
         "solar_forecast_kwh": solar_per_hour,
         "pv_surplus_kw": pv_surplus,
+        "pv_correction": pv_corr,
         "consumption_profiles": consumption["profiles"],
         "out_of_work_days": out_of_work_days,
         "horizon_dates": [d.isoformat() for d in h_dates],

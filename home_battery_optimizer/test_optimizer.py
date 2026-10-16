@@ -4,7 +4,7 @@ actually do, hour by hour.
 
 The key check replays each decision through the inverter's mode semantics
 (SBU = battery covers the whole house deficit, SUB/SNU = grid charges at the
-given amps, PV surplus always goes into the battery) and requires the
+given amps, PV surplus always goes into the battery; SUB/OSO never appears) and requires the
 resulting SOC to match the plan's ``soc_pct``.
 
 Run:
@@ -25,6 +25,7 @@ from battery_model import (  # noqa: E402
     GRID_LIMIT_KW,
     MAX_CHARGE_CURRENT_A,
     MAX_SOC,
+    MAX_TOTAL_CHARGE_CURRENT_A,
     NOMINAL_VOLTAGE,
     TOTAL_CAPACITY_WH,
 )
@@ -47,13 +48,16 @@ def _replay(result, deficit, surplus, soc0):
     """Recompute SOC from the chosen modes only and compare with the plan."""
     soc = soc0 * CAP_KWH
     hi = max(MAX_SOC, soc0) * CAP_KWH
-    for d in result["decisions"]:
-        h = d["hour"]
+    for i, d in enumerate(result["decisions"]):
+        h = len(deficit) - len(result["decisions"]) + i
+        # Only two modes: offgrid, or AC on and charging — never a plain bypass.
+        assert (d["output_mode"], d["charger_mode"]) in (("SBU", "OSO"), ("SUB", "SNU")), d
+        assert d["ac_on"] == (d["output_mode"] == "SUB") and (not d["ac_on"] or d["charge_amps"] >= 10), d
         if d["output_mode"] == "SBU":
             soc -= deficit[h] / DISCHARGE_EFFICIENCY
         grid_in = d["charge_amps"] * NOMINAL_VOLTAGE / 1000
         soc += grid_in
-        pv_room = MAX_CHARGE_CURRENT_A * NOMINAL_VOLTAGE / 1000 - grid_in
+        pv_room = MAX_TOTAL_CHARGE_CURRENT_A * NOMINAL_VOLTAGE / 1000 - grid_in
         soc += min(CHARGE_EFFICIENCY * surplus[h], pv_room, max(0.0, hi - soc))
         assert abs(soc / CAP_KWH * 100 - d["soc_pct"]) < 0.2, (h, soc / CAP_KWH, d)
         # Grid import next to the dummy circuit must stay under the breaker.
@@ -101,7 +105,7 @@ def check_breaker_caps_charging():
     load = [2.0] * 24
     r = optimize(_prices(PRICES), load, 0.15, target_soc=0.9)
     _replay(r, load, [0.0] * 24, 0.15)
-    # 5.75 kW breaker − 2 kW house leaves room for 60 A, not 90 A.
+    # 5.75 kW breaker − 2 kW house leaves room for 60 A, not 80 A.
     assert max(d["charge_amps"] for d in r["decisions"]) == 60
 
 
@@ -111,11 +115,39 @@ def check_never_infeasible():
     assert r["summary"]["target_reached"] is False and r["warnings"]
     assert r["summary"]["final_soc"] > 10
     # Negative hours at midnight, empty battery, house above what the breaker
-    # leaves next to the dummy load: the house stays on the grid, flagged.
+    # leaves next to the dummy load: the house stays on the grid, flagged,
+    # and every grid hour still charges (no plain bypass).
     prices = [-0.5] * 4 + PRICES[4:]
     r = optimize(_prices(prices), [2.0] * 24, 0.10)
     assert r["summary"]["grid_over_limit_kwh"] > 0 and r["warnings"]
-    assert all(d["charge_amps"] == 0 for d in r["decisions"][:4])
+    assert all(d["ac_on"] == (d["charge_amps"] >= 10) for d in r["decisions"])
+
+
+def check_offgrid_priority():
+    # PV covers the house all day: no reason to touch the grid, even at flat prices.
+    r = optimize(_prices([1.0] * 24), [0.0] * 24, 0.5, pv_surplus_kw=[0.5] * 24)
+    assert all(d["mode"] == "offgrid" for d in r["decisions"]), r["decisions"]
+
+
+def check_joint_horizon_sees_tomorrow():
+    # Cheap today, dear tomorrow, no PV: today's plan already buys for tomorrow,
+    # which a day-by-day plan (today ends at MinSOC) never did.
+    prices = _prices([0.5] * 24 + [2.0] * 24)
+    load = LOAD + LOAD
+    r = optimize(prices, load, 0.30, start_hour=10)
+    _replay(r, load, [0.0] * 48, 0.30)
+    today, tomorrow = r["blocks"]
+    assert len(today["decisions"]) == 14 and len(tomorrow["decisions"]) == 24
+    assert tomorrow["decisions"][0]["hour"] == 0
+    assert today["summary"]["final_soc"] > 50 and tomorrow["summary"]["total_grid_kwh"] < 1
+
+
+def check_day_targets():
+    prices = _prices(PRICES + PRICES)
+    r = optimize(prices, LOAD + LOAD, 0.30, day_targets={0: 0.8})
+    assert r["blocks"][0]["summary"]["target_reached"] is True
+    assert r["blocks"][0]["summary"]["final_soc"] >= 79.9
+    assert r["blocks"][1]["summary"]["target_reached"] is None
 
 
 def check_min_cost_per_kwh_still_works():
@@ -130,5 +162,8 @@ if __name__ == "__main__":
     check_negative_prices_beyond_capacity()
     check_breaker_caps_charging()
     check_never_infeasible()
+    check_offgrid_priority()
+    check_joint_horizon_sees_tomorrow()
+    check_day_targets()
     check_min_cost_per_kwh_still_works()
     print("optimizer self-check OK")

@@ -16,7 +16,10 @@ Endpoints:
 """
 
 import json
+import os
 import sys
+import threading
+import time
 from contextlib import redirect_stderr
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
@@ -179,6 +182,7 @@ def _get_data(
                 aux["raw_consumption"] = data.get("raw_consumption")
                 aux["solar_forecast_kwh"] = data.get("solar_forecast_kwh")
                 aux["pv_surplus_kw"] = data.get("pv_surplus_kw")
+                aux["pv_correction"] = data.get("pv_correction")
                 aux["out_of_work_days"] = data.get("out_of_work_days")
                 aux["horizon_dates"] = data.get("horizon_dates")
                 initial_soc = data["soc"]
@@ -226,55 +230,7 @@ def _has_estimated_prices(prices):
     return any(p.get("is_estimated", False) for p in prices)
 
 
-def _run_optimization(
-    prices,
-    dummy_loads,
-    initial_soc,
-    target_soc=None,
-    start_hour=0,
-    objective=OBJECTIVE_MIN_COST,
-    max_soc: float = 0.95,
-    min_soc: float = 0.10,
-    pv_surplus=None,
-):
-    """Run optimization and return (result, warnings).
-
-    Args:
-        prices: 24-hour price list.
-        dummy_loads: 24-hour load profile.
-        initial_soc: SOC at start_hour (0–1).
-        target_soc: Target end-of-day SOC fraction (0–1), or None.
-        start_hour: First hour to optimize (past hours are skipped).
-        max_soc, min_soc: SOC bounds (fractions).
-        pv_surplus: 24-hour PV surplus over the house load (kW), or None.
-
-    Returns:
-        (result_dict, warnings_list)
-    """
-    warnings = []
-
-    if _has_estimated_prices(prices):
-        warnings.append(
-            "Tomorrow's pricing data unavailable — using today's prices as estimation"
-        )
-
-    result = optimize(
-        prices, dummy_loads, initial_soc, target_soc=target_soc,
-        start_hour=start_hour, objective=objective,
-        max_soc=max_soc, min_soc=min_soc, pv_surplus_kw=pv_surplus,
-    )
-
-    # Inject charge_kwh (signed) into each decision
-    for d in result["decisions"]:
-        d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
-
-    if _has_estimated_prices(prices):
-        result["is_estimated"] = True
-
-    return result, warnings
-
-
-def _run_multi_day_optimization(
+def _run_horizon_optimization(
     prices,
     dummy_loads,
     initial_soc,
@@ -285,95 +241,131 @@ def _run_multi_day_optimization(
     overrides: Optional[OptimizerOverrides] = None,
     pv_surplus: Optional[list[float]] = None,
 ):
-    """Run optimization for multiple days (e.g. today + tomorrow).
+    """Optimise the whole horizon — rest of today, tomorrow, estimated hours —
+    as one plan, then split it per calendar day.
 
     Per-day knobs are resolved from ``overrides``:
       * Full-charge days (day-of-month in ``overrides.full_charge_days``)
-        get ``max_soc=1.0``.
-      * ``overrides.per_date_target_soc`` pins the EOD SOC for matching
-        ISO-date keys; falls back to the global ``target_soc`` otherwise.
-
-    Args:
-        prices: List of 24×n price dicts (today first, then tomorrow, etc.).
-        dummy_loads: Reusable 24-hour load profile.
-        initial_soc: SOC at the beginning of day 1 (0–1).
-        target_soc: Global fallback EOD SOC fraction (0–1), or None.
-        start_hour: First hour to optimize on day 1 (past hours skipped).
-        horizon_dates: ISO date strings aligned with each 24-hour block.
-                       Required for full-charge-days / per-date scheduling
-                       to take effect (silently skipped if missing).
-        overrides: Optional :class:`OptimizerOverrides`.
+        get ``max_soc=1.0`` for their hours.
+      * ``overrides.per_date_target_soc`` (else the global ``target_soc``)
+        is a floor on the SOC at the end of each day with published prices.
+    With no target (``target_soc=-1``) the plan is automatic: the cheapest
+    one that keeps the SOC above MinSOC over the whole horizon.
 
     Returns:
-        List of result dicts with a 'day_label' key prepended.
+        (list of per-day result dicts, horizon result from :func:`optimize`).
     """
     if overrides is None:
         overrides = OptimizerOverrides()
 
-    all_results = []
-    n_days = len(prices) // 24
-    current_soc = initial_soc
+    n_days = -(-len(prices) // 24)
+    if len(dummy_loads) == 24 and len(prices) > 24:  # mock: one day reused
+        dummy_loads = (list(dummy_loads) * n_days)[: len(prices)]
+    days = [date.fromisoformat(d) for d in (horizon_dates or [])][:n_days]
+    day_max = [
+        overrides.max_soc_for_date(days[b]) if b < len(days) else overrides.max_soc_pct / 100.0
+        for b in range(n_days)
+    ]
+    estimated = [_has_estimated_prices(prices[b * 24 : (b + 1) * 24]) for b in range(n_days)]
 
-    for i in range(n_days):
-        start = i * 24
-        end = min(start + 24, len(prices))
-        if start >= end:
-            break
+    fallback = target_soc * 100.0 if target_soc is not None else None
+    day_targets = {}
+    for b, d in enumerate(days):
+        t = overrides.target_soc_for_date(d, fallback_pct=fallback)
+        if t is not None and not estimated[b]:  # no pins on guessed prices
+            day_targets[b] = t
 
-        day_prices = prices[start:end]
-        # dummy_loads is horizon-aligned (matches prices length). For mock it
-        # may be a single 24h list — reuse it for each day in that case.
-        if len(dummy_loads) == 24 and len(prices) > 24:
-            day_loads = dummy_loads
-        else:
-            day_loads = dummy_loads[start:end]
-        day_pv = pv_surplus[start:end] if pv_surplus else None
+    result = optimize(
+        prices, dummy_loads, initial_soc, start_hour=start_hour, objective=objective,
+        max_soc=[day_max[i // 24] for i in range(len(prices))],
+        min_soc=overrides.min_soc(), pv_surplus_kw=pv_surplus, day_targets=day_targets,
+    )
 
-        # First day skips past hours; subsequent days optimize full day
-        day_start_hour = start_hour if i == 0 else 0
+    per_day = []
+    for b, block in enumerate(result["blocks"]):
+        for d in block["decisions"]:
+            d["charge_kwh"] = round(d["charge_wh"] / 1000 - d["discharge_wh"] / 1000, 4)
+        r = {
+            "decisions": block["decisions"],
+            "summary": block["summary"],
+            "warnings": result["warnings"] if b == 0 else [],
+            "objective": objective,
+            "max_soc_pct": round(day_max[b] * 100, 1),
+            "min_soc_pct": result["min_soc_pct"],
+            # Visible in the response so the dashboard can show "Balance day: full charge".
+            "is_full_charge_day": day_max[b] >= 0.999,
+        }
+        if b in day_targets:
+            r["effective_target_soc_pct"] = round(day_targets[b] * 100, 1)
+        if estimated[b]:
+            r["is_estimated"] = True
+        for key in ("chosen_target_soc_pct", "chosen_cost_per_kwh"):
+            if key in result:
+                r[key] = result[key]
+        per_day.append(r)
+    return per_day, result
 
-        # Resolve per-day MaxSOC (full-charge balance day?) and target SOC.
-        day_obj: Optional[date] = None
-        if horizon_dates and i < len(horizon_dates):
-            try:
-                day_obj = date.fromisoformat(horizon_dates[i])
-            except ValueError:
-                day_obj = None
 
-        day_max_soc = (
-            overrides.max_soc_for_date(day_obj)
-            if day_obj is not None
-            else overrides.max_soc_pct / 100.0
-        )
-        day_min_soc = overrides.min_soc()
+def _plan(responses: list[dict], initial_soc: float, target_soc, min_soc_pct: float) -> Optional[dict]:
+    """What to do with the AC breaker and the inverter, hour by hour.
 
-        # Per-date target SOC wins over the global one; if neither set, None.
-        day_target_soc = overrides.target_soc_for_date(
-            day_obj,
-            fallback_pct=target_soc * 100.0 if target_soc is not None else None,
-        )
+    Not a prosumer site: grid energy only flows in (house + charging), PV
+    the battery can't take is curtailed (``pv_lost_kwh``), nothing is exported.
+    """
+    hours = [d for r in responses for d in r["decisions"]]
+    if not hours:
+        return None
 
-        try:
-            result, warnings = _run_optimization(
-                day_prices, day_loads, current_soc, day_target_soc,
-                day_start_hour, objective,
-                max_soc=day_max_soc, min_soc=day_min_soc, pv_surplus=day_pv,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Optimization failed for day {i + 1}: {e}") from e
+    def end_of(d):
+        return (datetime.fromisoformat(d["start"]) + timedelta(hours=1)).isoformat()
 
-        # Annotate result with the per-day MaxSOC actually used (visible in
-        # the response so the dashboard can show "Balance day: full charge").
-        result["is_full_charge_day"] = day_max_soc >= 0.999
-        if day_target_soc is not None:
-            result["effective_target_soc_pct"] = round(day_target_soc * 100, 1)
+    windows: list[dict] = []
+    soc_before = initial_soc * 100
+    for d in hours:
+        if d["ac_on"]:
+            if windows and windows[-1]["end"] == d["start"]:
+                w = windows[-1]
+            else:
+                w = {"start": d["start"], "soc_from_pct": round(soc_before, 1), "max_amps": 0,
+                     "grid_kwh": 0.0, "cost_pln": 0.0, "is_estimated": False}
+                windows.append(w)
+            w["end"] = end_of(d)
+            w["max_amps"] = max(w["max_amps"], d["charge_amps"])
+            w["grid_kwh"] = round(w["grid_kwh"] + d["grid_kwh"], 3)
+            w["cost_pln"] = round(w["cost_pln"] + d["grid_cost_pln"], 4)
+            w["soc_to_pct"] = d["soc_pct"]
+            w["is_estimated"] = w["is_estimated"] or d["is_estimated"]
+        soc_before = d["soc_pct"]
+    for w in windows:
+        w["avg_price_plkwh"] = round(w["cost_pln"] / w["grid_kwh"], 4) if w["grid_kwh"] else None
 
-        # Propagate SOC to next day
-        current_soc = result["summary"]["final_soc"] / 100.0
-
-        all_results.append(result)
-
-    return all_results
+    now = hours[0]
+    change = next((d for d in hours[1:] if d["mode"] != now["mode"]), None)
+    low = min(hours, key=lambda d: d["soc_pct"])
+    estimated = next((d for d in hours if d["is_estimated"]), None)
+    keys = ("start", "mode", "ac_on", "output_mode", "charger_mode", "charge_amps", "soc_pct", "price_plkwh")
+    return {
+        "generated_at": datetime.now(WARSAW_TZ).isoformat(timespec="seconds"),
+        "target_soc": "auto" if target_soc is None else round(target_soc * 100, 1),
+        "min_soc_pct": min_soc_pct,
+        "now": {k: now[k] for k in keys},
+        "next_change": None if change is None else {
+            "at": change["start"], "mode": change["mode"], "ac_on": change["ac_on"],
+            "charge_amps": change["charge_amps"],
+        },
+        "ac_windows": windows,
+        "totals": {
+            "grid_kwh": round(sum(d["grid_kwh"] for d in hours), 3),
+            "cost_pln": round(sum(d["grid_cost_pln"] for d in hours), 4),
+            "pv_lost_kwh": round(sum(d["pv_lost_kwh"] for d in hours), 3),
+            "ac_hours": len([d for d in hours if d["ac_on"]]),
+            "min_soc_pct": low["soc_pct"],
+            "min_soc_at": end_of(low),
+            "final_soc_pct": hours[-1]["soc_pct"],
+            "horizon_end": end_of(hours[-1]),
+            "estimated_prices_from": estimated["start"] if estimated else None,
+        },
+    }
 
 
 def _run_sensitivity(
@@ -498,7 +490,7 @@ def _request_args() -> dict:
 def _apply_history_adjustments(
     overrides: OptimizerOverrides, use_adjustments: bool
 ) -> dict:
-    """Fold the reconciled per-(weekday, hour) multipliers into ``overrides``.
+    """Fold the reconciled per-(weekday, hour) consumption multipliers into ``overrides``.
 
     When ``use_adjustments`` is false the override fields stay ``None`` and
     the optimizer behaves as if no reconciliation history existed at all
@@ -510,21 +502,15 @@ def _apply_history_adjustments(
     """
     if not use_adjustments:
         overrides.consumption_adjustment = None
-        overrides.solar_adjustment = None
         return {"applied": False, "buckets": 0}
 
     raw = history_db.get_adjustments()
-    cons_map: dict[tuple[int, int], float] = {}
-    sol_map: dict[tuple[int, int], float] = {}
-    for key, vals in raw.items():
-        cm = vals.get("consumption_multiplier")
-        sm = vals.get("solar_multiplier")
-        if cm is not None:
-            cons_map[key] = float(cm)
-        if sm is not None:
-            sol_map[key] = float(sm)
+    cons_map = {
+        key: float(vals["consumption_multiplier"])
+        for key, vals in raw.items()
+        if vals.get("consumption_multiplier") is not None
+    }
     overrides.consumption_adjustment = cons_map or None
-    overrides.solar_adjustment = sol_map or None
     return {"applied": True, "buckets": len(raw)}
 
 
@@ -596,10 +582,12 @@ def optimize_endpoint():
         ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
         ha_token        — HA long-lived access token (required unless mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
-        days            — Days of history to fetch (default: 7)
+        days            — Days of load history for the profile (default: 28)
 
     Solver knobs:
-        target_soc          — Global EOD SOC % (0–100) or -1/omitted for free.
+        target_soc          — EOD SOC % (0–100) for every day with published
+                              prices, or -1/omitted = automatic (cheapest plan
+                              that never drops below min_soc_pct).
         objective           — 'min_cost' or 'min_cost_per_kwh'.
 
     GBB-inspired overrides (all optional):
@@ -626,7 +614,7 @@ def optimize_endpoint():
     ha_url = args.get("ha_url", "https://ha.kompfix.pl")
     ha_token = args.get("ha_token", "")
     horizon = args.get("horizon", "available")
-    days = int(args.get("days", 7))
+    days = int(args.get("days", 28))
     target_soc_raw = args.get("target_soc")
 
     # Validate
@@ -669,6 +657,9 @@ def optimize_endpoint():
         use_adjustments = True
     adj_meta = _apply_history_adjustments(overrides, use_adjustments)
 
+    if not mock:
+        _last_ha.update(url=ha_url, token=ha_token)  # for the nightly reconcile
+
     # Fetch data with overrides applied to consumption/solar/net-load
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
         mock, ha_url, ha_token, horizon, days, overrides=overrides
@@ -683,9 +674,9 @@ def optimize_endpoint():
         now_warsaw = datetime.now(WARSAW_TZ)
         start_hour = now_warsaw.hour
 
-    # Run optimization (handles multi-day when horizon="available")
+    # One joint plan over every hour with a price (published or estimated).
     try:
-        all_results = _run_multi_day_optimization(
+        all_results, _ = _run_horizon_optimization(
             prices, dummy_loads, initial_soc, target_soc, start_hour, objective,
             horizon_dates=aux.get("horizon_dates"),
             overrides=overrides,
@@ -707,14 +698,18 @@ def optimize_endpoint():
         else:
             date_label = f"Day {i + 1}"
 
+        block_date = horizon_dates[i] if i < len(horizon_dates) else None
+
         # Collect warnings from this day's optimization
         day_warnings = []
-        if _has_estimated_prices(prices[i * 24 : min((i + 1) * 24, len(prices))]):
+        if result.get("is_estimated"):
             day_warnings.append(
-                "Tomorrow's pricing data unavailable — using today's prices as estimation"
+                f"Prices for {block_date} not published yet — estimated from the last known day"
             )
-
-        block_date = horizon_dates[i] if i < len(horizon_dates) else None
+        if block_date:
+            midnight = datetime.combine(date.fromisoformat(block_date), datetime.min.time(), WARSAW_TZ)
+            for d in result["decisions"]:
+                d["start"] = (midnight + timedelta(hours=d["hour"])).isoformat()
         block_raw = raw_consumption[i * 24 : (i + 1) * 24] if raw_consumption else []
         block_solar = solar_kwh[i * 24 : (i + 1) * 24] if solar_kwh else []
 
@@ -728,6 +723,7 @@ def optimize_endpoint():
                 if result["decisions"]
                 else round(initial_soc * 100, 1),
                 "initial_soc_source": aux.get("soc_source"),
+                "pv_correction_today": aux.get("pv_correction"),
                 **result,
                 "raw_consumption_kw": block_raw,
                 "solar_forecast_kwh": block_solar,
@@ -743,11 +739,17 @@ def optimize_endpoint():
     # Record predictions for later reconciliation (best-effort, never fatal).
     _record_predictions_for_response(responses, adj_meta.get("applied", False))
 
+    plan = (
+        _plan(responses, initial_soc, target_soc, overrides.min_soc_pct)
+        if all("start" in d for r in responses for d in r["decisions"])
+        else None
+    )
+
     # Return single object or list depending on number of days
     if len(responses) == 1:
-        return jsonify(responses[0])
+        return jsonify({**responses[0], "plan": plan})
     return jsonify(
-        {"days": responses, "advisory": overrides.dry_run, "adjustments": adj_meta}
+        {"days": responses, "plan": plan, "advisory": overrides.dry_run, "adjustments": adj_meta}
     )
 
 
@@ -767,14 +769,14 @@ def sensitivity_endpoint():
         ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
         ha_token        — HA long-lived access token (required unless --mock)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
-        days            — Days of history to fetch (default: 7)
+        days            — Days of load history for the profile (default: 28)
     """
     args = _request_args()
     mock = _parse_bool(args.get("mock")) or False
     ha_url = args.get("ha_url", "https://ha.kompfix.pl")
     ha_token = args.get("ha_token", "")
     horizon = args.get("horizon", "available")
-    days = int(args.get("days", 7))
+    days = int(args.get("days", 28))
 
     # Validate
     if not mock and not ha_token:
@@ -1012,6 +1014,47 @@ def reconciliation_log_endpoint():
             "reconciled_dates": history_db.reconciled_dates(),
         }
     )
+
+
+# ── Nightly reconciliation ────────────────────────────────────────────────
+
+RECONCILE_HOUR = 3  # Warsaw local
+
+# HA credentials of the last live /optimize call (HA polls it hourly), unless
+# HA_URL / HA_TOKEN are set in the environment.  Kept in memory only.
+_last_ha: dict = {}
+
+
+def _seconds_until(hour: int) -> float:
+    now = datetime.now(WARSAW_TZ)
+    nxt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    # Through UTC: same-zone subtraction ignores a DST change in between.
+    return (nxt.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()
+
+
+def _nightly_reconcile() -> None:
+    """Every night: pull yesterday's actuals from HA and update the learned multipliers."""
+    while True:
+        time.sleep(_seconds_until(RECONCILE_HOUR))
+        url = os.environ.get("HA_URL") or _last_ha.get("url")
+        token = os.environ.get("HA_TOKEN") or _last_ha.get("token")
+        if not (url and token):
+            print("[reconcile] skipped: no HA credentials yet (HA_URL/HA_TOKEN or a live /optimize call)",
+                  file=sys.stderr)
+            continue
+        try:
+            for r in reconciliation.auto_reconcile_recent(
+                _build_base_url(url), token, days_back=1, today=datetime.now(WARSAW_TZ).date()
+            ):
+                print(f"[reconcile] {r.target_date}: {r.notes}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — keep the loop alive
+            print(f"[reconcile] failed: {e}", file=sys.stderr)
+
+
+# shortcut: Flask's debug reloader imports this twice and would reconcile twice; fine for uvicorn/supervisor.
+threading.Thread(target=_nightly_reconcile, name="nightly-reconcile", daemon=True).start()
 
 
 # ── ASGI wrapper for uvicorn (Flask is WSGI, uvicorn expects ASGI) ────────
