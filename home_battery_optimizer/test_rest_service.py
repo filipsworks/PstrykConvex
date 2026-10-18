@@ -61,6 +61,19 @@ def main() -> None:
         == plan["totals"]["ac_hours"] == len([d for d in hours if d["ac_on"]])
     assert plan["totals"]["estimated_prices_from"] == days[2]["decisions"][0]["start"]
 
+    # 'today' / 'tomorrow' are days of the same joint plan: tomorrow starts
+    # where today ends, not from the SOC right now.
+    full = c.get("/optimize?ha_token=x").get_json()["days"]
+    today = c.get("/optimize?ha_token=x&horizon=today").get_json()
+    tomorrow = c.get("/optimize?ha_token=x&horizon=tomorrow").get_json()
+    assert (today["date"], tomorrow["date"]) == (full[0]["date"], full[1]["date"])
+    assert today["decisions"] == full[0]["decisions"] and tomorrow["decisions"] == full[1]["decisions"]
+    first = tomorrow["decisions"][0]
+    soc_before = first["soc_pct"] - (first["charge_wh"] + first["pv_charge_wh"] - first["discharge_wh"]) / 166.4
+    assert abs(soc_before - today["summary"]["final_soc"]) < 0.2, (soc_before, today["summary"]["final_soc"])
+    sens = c.get("/sensitivity?ha_token=x&horizon=tomorrow").get_json()
+    assert sens["date"] == full[1]["date"] and sens["initial_soc_pct"] == today["summary"]["final_soc"]
+
     # Automatic target: never below MinSOC, no day pins.
     r = c.get("/optimize?ha_token=x&target_soc=-1").get_json()
     assert r["plan"]["target_soc"] == "auto"

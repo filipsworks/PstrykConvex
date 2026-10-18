@@ -660,19 +660,13 @@ def optimize_endpoint():
     if not mock:
         _last_ha.update(url=ha_url, token=ha_token)  # for the nightly reconcile
 
-    # Fetch data with overrides applied to consumption/solar/net-load
+    # Always plan the whole horizon from now; 'today' / 'tomorrow' only pick
+    # which day of that plan is returned, so tomorrow starts from the SOC the
+    # plan reaches at midnight, not from the SOC right now.
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
-        mock, ha_url, ha_token, horizon, days, overrides=overrides
+        mock, ha_url, ha_token, "available", days, overrides=overrides
     )
-
-    # Calculate start_hour: skip past hours for live runs.
-    # "today" and "available" both start with today; only "tomorrow" is
-    # fully in the future.
-    if mock or horizon == "tomorrow":
-        start_hour = 0
-    else:
-        now_warsaw = datetime.now(WARSAW_TZ)
-        start_hour = now_warsaw.hour
+    start_hour = 0 if mock else datetime.now(WARSAW_TZ).hour
 
     # One joint plan over every hour with a price (published or estimated).
     try:
@@ -693,11 +687,7 @@ def optimize_endpoint():
     # Build response with day labels
     responses = []
     for i, result in enumerate(all_results):
-        if len(all_results) == 1 and horizon != "available":
-            date_label = horizon.capitalize()
-        else:
-            date_label = f"Day {i + 1}"
-
+        date_label = f"Day {i + 1}"
         block_date = horizon_dates[i] if i < len(horizon_dates) else None
 
         # Collect warnings from this day's optimization
@@ -744,6 +734,12 @@ def optimize_endpoint():
         if all("start" in d for r in responses for d in r["decisions"])
         else None
     )
+
+    if horizon != "available" and not mock:  # mock is one sample day
+        wanted = datetime.now(WARSAW_TZ).date() + timedelta(days=1 if horizon == "tomorrow" else 0)
+        responses = [r for r in responses if r["date"] == wanted.isoformat()]
+        for r in responses:
+            r["day_label"] = horizon.capitalize()
 
     # Return single object or list depending on number of days
     if len(responses) == 1:
@@ -796,23 +792,28 @@ def sensitivity_endpoint():
         use_adjustments = True
     adj_meta = _apply_history_adjustments(overrides, use_adjustments)
 
-    # Fetch data (use first day's prices for sensitivity)
+    # Sweep one day: today from now, or tomorrow from the SOC the joint plan
+    # reaches at midnight (not the SOC right now).
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
-        mock, ha_url, ha_token, horizon, days, overrides=overrides
+        mock, ha_url, ha_token, "available", days, overrides=overrides
     )
+    b = 1 if horizon == "tomorrow" and not mock and len(prices) > 24 else 0
+    start_hour = 0 if mock or b else datetime.now(WARSAW_TZ).hour
+    if b:
+        try:
+            per_day, _ = _run_horizon_optimization(
+                prices, dummy_loads, initial_soc, None, start_hour=datetime.now(WARSAW_TZ).hour,
+                horizon_dates=aux.get("horizon_dates"), overrides=overrides,
+                pv_surplus=aux.get("pv_surplus_kw"),
+            )
+        except Exception as e:
+            return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
+        initial_soc = per_day[0]["summary"]["final_soc"] / 100.0
+    day = slice(24 * b, 24 * b + 24)
 
-    # Calculate start_hour: skip past hours for live runs.
-    # "today" and "available" both start with today; only "tomorrow" is
-    # fully in the future.
-    if mock or horizon == "tomorrow":
-        start_hour = 0
-    else:
-        now_warsaw = datetime.now(WARSAW_TZ)
-        start_hour = now_warsaw.hour
-
-    # Resolve per-day MaxSOC for the first horizon day so the sweep is
+    # Resolve per-day MaxSOC for the swept day so the sweep is
     # clamped to whatever the user chose (e.g. balance day → 100%).
-    horizon_dates = aux.get("horizon_dates") or []
+    horizon_dates = (aux.get("horizon_dates") or [])[b:]
     first_day_obj = None
     if horizon_dates:
         try:
@@ -827,15 +828,12 @@ def sensitivity_endpoint():
     )
     day_min_soc = overrides.min_soc()
 
-    # Run sensitivity (uses first 24h of prices and the matching 24h of loads)
-    day_loads = (
-        dummy_loads if len(dummy_loads) == 24 else dummy_loads[:24]
-    )
+    # Run sensitivity on the swept day's 24h of prices, loads and PV
     try:
         result, stderr_content = _run_sensitivity(
-            prices[:24], day_loads, initial_soc, start_hour=start_hour,
+            prices[day], dummy_loads[day], initial_soc, start_hour=start_hour,
             max_soc=day_max_soc, min_soc=day_min_soc,
-            pv_surplus=(aux.get("pv_surplus_kw") or [])[:24] or None,
+            pv_surplus=(aux.get("pv_surplus_kw") or [])[day] or None,
         )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500
@@ -848,8 +846,8 @@ def sensitivity_endpoint():
         "horizon": horizon,
         "date": first_date,
         "is_out_of_work": first_date in out_of_work_set if first_date else None,
-        "raw_consumption_kw": (aux.get("raw_consumption") or [])[:24],
-        "solar_forecast_kwh": (aux.get("solar_forecast_kwh") or [])[:24],
+        "raw_consumption_kw": (aux.get("raw_consumption") or [])[day],
+        "solar_forecast_kwh": (aux.get("solar_forecast_kwh") or [])[day],
         "warnings": stderr_log.strip().splitlines() if stderr_log else [],
         "advisory": overrides.dry_run,
         "overrides_active": overrides.summary(),

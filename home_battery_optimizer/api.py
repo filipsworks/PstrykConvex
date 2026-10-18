@@ -780,7 +780,8 @@ def fetch_all_data(
         days: Days of history for the weekday × hour consumption profile
               (default 28 — four samples of every weekday).
         horizon: 'today', 'tomorrow', or 'available'.  'available' is padded
-                 with estimated prices to :data:`MIN_HORIZON_H` hours ahead.
+                 with estimated prices to :data:`MIN_HORIZON_H` hours ahead
+                 and at least to the end of tomorrow.
         overrides: Optional :class:`OptimizerOverrides` applied to the
                    consumption profile, PV forecast, and net load.  When
                    omitted, default (no-op) overrides are used so callers
@@ -810,7 +811,8 @@ def fetch_all_data(
     now = datetime.now(WARSAW_TZ)
     prices = fetch_hourly_prices(base_url, token, horizon=horizon)
     if horizon == "available" and prices:
-        prices = _pad_with_estimates(prices, now.hour + MIN_HORIZON_H)
+        # At least to tomorrow's midnight, so tomorrow is always a whole day.
+        prices = _pad_with_estimates(prices, max(now.hour + MIN_HORIZON_H, 48))
     soc, soc_source = fetch_initial_soc(base_url, token)
 
     h_dates = _horizon_dates(horizon, prices)

@@ -108,7 +108,7 @@ Run the charging optimization and return JSON results.
 | `mock` | boolean | `false` | No (unless no token) | Use sample data instead of Home Assistant API |
 | `ha_url` | string | `https://ha.kompfix.pl` | No | Home Assistant base URL (without `/api`) |
 | `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
-| `horizon` | enum | `available` | No | Which prices to plan over: `today`, `tomorrow`, or `available` (today + tomorrow once published, padded with **estimated** hours — the last known day repeated — to at least 36 h ahead). Every hour is solved as **one** plan. |
+| `horizon` | enum | `available` | No | Which day(s) to return. The plan always covers today + tomorrow once published, padded with **estimated** hours (the last known day repeated) to at least 36 h ahead and to the end of tomorrow, solved as **one** plan from now. `available` returns every day; `today` / `tomorrow` return just that day of the same plan — so tomorrow starts from the SOC the plan reaches at midnight. |
 | `days` | integer | `28` | No | Days of load history for the weekday×hour profile (28 = four samples of every weekday) |
 | `target_soc` | float | `-1` | No | EOD SOC % (0–100), a floor at the end of every day with published prices. `-1` or omitted = **automatic**: the cheapest plan that never lets the SOC drop below `min_soc_pct` over the whole horizon. Beaten by `per_date_target_soc` for matching dates. |
 | `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
