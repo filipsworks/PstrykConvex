@@ -34,6 +34,11 @@ _EPS = 1e-4
 # only misses a limit when no plan can keep it.
 _PENALTY = 1000.0
 
+# PLN per 10 A step a cheaper charging hour stays below its cap while a
+# dearer one charges — above any price gap a step can make, below a missed
+# SOC target or reserve, so the rule only gives way to those.
+_RULE_PENALTY = 10.0
+
 # Per-solve cap for the MILP (seconds); see the solve call.
 MIP_TIME_LIMIT_S = 3
 
@@ -70,6 +75,7 @@ def _build_and_solve(
     min_soc: float = MIN_SOC,
     pv_surplus_kw: list[float] | None = None,
     day_targets: dict[int, float] | None = None,
+    cheapest_first: bool = True,
 ) -> dict:
     """Core MILP: minimise grid cost for hours [start_hour, len(prices)).
 
@@ -148,11 +154,12 @@ def _build_and_solve(
     grid_load = cp.multiply(deficit, 1 - sbu)              # grid → house kW
     discharge = cp.multiply(deficit / eta_dis, sbu)        # battery-side kW
 
-    # The breaker cap and the SOC targets are soft: a plan always exists, so
-    # the solver never reports infeasible.  The house alone can exceed what
+    # The breaker cap, the SOC reserve and the SOC targets are soft: a plan
+    # always exists, so the solver never reports infeasible.  The house alone can exceed what
     # negative-price hours leave next to the dummy circuit, and late in the
     # day a target may be out of reach.
     over = cp.Variable(n, nonneg=True)   # kW of grid import over the breaker cap
+    under = cp.Variable(n, nonneg=True)  # SOC below the reserve
     # SOC missing to each target (cvxpy has no 0-size variables; a spare one stays 0).
     short = cp.Variable(max(1, len(targets)), nonneg=True)
 
@@ -160,7 +167,7 @@ def _build_and_solve(
         soc[0] == initial_soc,
         soc[1:] == soc[:-1]
         + (k * step_kw + eta_ch * pv_in - discharge) / capacity_kwh,
-        soc[1:] >= soc_lo,
+        soc[1:] + under >= soc_lo,
         soc[1:] <= soc_hi,
         # AC on only to charge: a grid hour always takes at least one step.
         k >= 1 - sbu,
@@ -173,6 +180,27 @@ def _build_and_solve(
         # still trip the breaker; lower GRID_LIMIT_KW if that happens.
         grid_load + grid_charge <= grid_cap + over,
     ]
+    # Fill the cheaper charging hour to its full current before a dearer one:
+    # when both charge, the cheaper runs at its cap (80 A, less where the
+    # breaker leaves less), so the rest of a 10 A step lands on the dearest
+    # charging hour instead of small charges spread over pricier hours.
+    # A grid hour forced by the reserve (offgrid would drop the SOC below it)
+    # is exempt: it must take 10 A anyway and says nothing about prices.
+    step_grid_kw = step_kw / eta_ch
+    k_cap = np.floor(np.minimum(grid_cap - deficit, MAX_CHARGE_POWER_KW) / step_grid_kw + 1e-9)
+    k_cap = np.clip(k_cap, 0, k_max)
+    # Charging never plans past what the breaker leaves; only the house load
+    # itself may (the 'over' slack), and a forced grid hour still gets 10 A.
+    constraints.append(k <= np.maximum(k_cap, 1))
+    cheap, dear = np.nonzero(price[:, None] < price[None, :])
+    missed = cp.Variable(n, nonneg=True)  # steps a cheaper hour stays below its cap
+    if cheapest_first and len(cheap):
+        voluntary = cp.Variable(n, boolean=True)  # offgrid would keep the reserve
+        constraints += [
+            voluntary >= soc[:-1] - deficit / eta_dis / capacity_kwh - soc_lo,
+            k[cheap] + missed[cheap] >= cp.multiply(k_cap[cheap], voluntary[dear] - sbu[cheap] - sbu[dear]),
+        ]
+
     for i, (t, tgt) in enumerate(targets.items()):
         constraints.append(soc[t] + short[i] >= tgt)
         print(f"  → SOC ≥ {tgt * 100:.0f}% after {t} h", file=sys.stderr)
@@ -184,7 +212,8 @@ def _build_and_solve(
     pv_weight = _EPS * np.arange(n, 0, -1) / n
     objective = cp.Minimize(
         price @ (grid_load + grid_charge) - _EPS * cp.sum(sbu) - pv_weight @ pv_in
-        + _PENALTY * (cp.sum(over) + cp.sum(short) * capacity_kwh)
+        + _PENALTY * (cp.sum(over) + (cp.sum(short) + cp.sum(under)) * capacity_kwh)
+        + _RULE_PENALTY * cp.sum(missed)
     )
 
     problem = cp.Problem(objective, constraints)
@@ -194,6 +223,16 @@ def _build_and_solve(
     problem.solve(
         solver=cp.HIGHS, verbose=False, time_limit=MIP_TIME_LIMIT_S, mip_rel_gap=1e-3
     )
+
+    if cheapest_first and problem.status not in ("optimal", "optimal_inaccurate"):
+        # The pairwise rule can make a hard MILP; a plain cost-optimal plan
+        # beats a half-searched one.
+        result = _build_and_solve(
+            prices, dummy_loads_kw, initial_soc, target_soc, start_hour, max_soc,
+            min_soc, pv_surplus_kw, day_targets, cheapest_first=False,
+        )
+        result["warnings"].append("Solver ran out of time with the cheapest-hour-first rule; plan made without it")
+        return result
 
     timed_out_with_plan = problem.status == "user_limit" and sbu.value is not None
     if problem.status not in ("optimal", "optimal_inaccurate") and not timed_out_with_plan:
@@ -262,6 +301,12 @@ def _build_and_solve(
     )
 
     warnings = []
+    bent = [start_hour + t for t in range(n) if missed.value is not None and missed.value[t] > 0.5]
+    if bent:
+        warnings.append(f"Cheapest-hour-first rule bent in horizon hours {bent} to keep a SOC target or the reserve")
+    low_hours = [start_hour + t for t in range(n) if under.value[t] > 1e-3]
+    if low_hours:
+        warnings.append(f"SOC below the {soc_lo * 100:.0f}% reserve in horizon hours {low_hours}")
     for t, ok in reached.items():
         if not ok:
             warnings.append(

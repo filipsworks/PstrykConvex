@@ -110,7 +110,7 @@ Run the charging optimization and return JSON results.
 | `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
 | `horizon` | enum | `available` | No | Which day(s) to return. The plan always covers today + tomorrow once published, padded with **estimated** hours (the last known day repeated) to at least 36 h ahead and to the end of tomorrow, solved as **one** plan from now. `available` returns every day; `today` / `tomorrow` return just that day of the same plan — so tomorrow starts from the SOC the plan reaches at midnight. |
 | `days` | integer | `28` | No | Days of load history for the weekday×hour profile (28 = four samples of every weekday) |
-| `target_soc` | float | `-1` | No | EOD SOC % (0–100), a floor at the end of every day with published prices. `-1` or omitted = **automatic**: the cheapest plan that never lets the SOC drop below `min_soc_pct` over the whole horizon. Beaten by `per_date_target_soc` for matching dates. |
+| `target_soc` | float | *(dashboard)* | No | EOD SOC % (0–100) for the day `horizon` names (`today` / `tomorrow`; every published day for `available`). `-1` = **automatic** for that day: the cheapest plan that never lets the SOC drop below `min_soc_pct`. Days the request does not name take the dashboard helpers `input_number.soc_target_today` / `_tomorrow`, read from HA on every run — so the today and tomorrow sensors, each sending only its own target, plan with both. Beaten by `per_date_target_soc` for matching dates. |
 | `objective` | enum | `min_cost` | No | Optimisation objective: `min_cost` minimises total PLN spend; `min_cost_per_kwh` minimises average PLN/kWh (sweeps EOD SOC targets internally, `target_soc` is ignored). |
 | `use_adjustments` | boolean | `true` | No | When `false`, skip the learned `(weekday, hour)` multipliers from `/reconcile` history — i.e. run the optimizer on the raw learned profile without any reality-driven correction. Same flag is supported on `/sensitivity`. |
 
@@ -159,6 +159,14 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > The PV surplus (`max(0, solar − consumption)`) charges the battery for free
 > in every mode; whatever does not fit is curtailed (`pv_lost_kwh`) — this is
 > not a prosumer site, nothing is exported.
+
+> **Cheapest hour first:** when two hours both charge, the cheaper one runs at
+> its full current (80 A, or what the 25 A breaker leaves next to the house)
+> before a dearer one is used — the rest of a 10 A step lands on the dearest
+> charging hour. A grid hour forced by the reserve (offgrid would drop the
+> SOC below `min_soc_pct`) is exempt. The rule only gives way to a SOC target
+> or the reserve (flagged in `warnings`); if the solver cannot finish with it
+> in time, the plan is made without it (also flagged).
 
 > **Inverter model — offgrid first, two modes only:** every hour is either
 > `SBU/OSO` (offgrid: AC breaker off, the battery covers the *whole* house

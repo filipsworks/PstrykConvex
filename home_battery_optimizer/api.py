@@ -51,6 +51,10 @@ SOLAR_FORECAST_D2_ENTITY = "sensor.dom_energy_production_d2"
 # for the intraday forecast correction.
 PV_ENERGY_TODAY_ENTITY = "sensor.inverter_e50000254944442369_dessmonitor_energy_today"
 
+# Dashboard helpers holding the end-of-day SOC target (%) for today and
+# tomorrow; -1 = automatic.  Read on every run so each request plans with both.
+SOC_TARGET_ENTITIES = {0: "input_number.soc_target_today", 1: "input_number.soc_target_tomorrow"}
+
 # The "available" horizon is padded with estimated prices (the last known
 # day, hour by hour) to at least this many hours from now, so a plan made
 # before tomorrow's prices are out still keeps power on through tomorrow.
@@ -242,6 +246,25 @@ def fetch_initial_soc(base_url: str, token: str) -> tuple[float, str]:
     if voltage is not None:
         return voltage_to_soc(voltage), "voltage"
     return 0.5, "default"
+
+
+def fetch_day_targets(base_url: str, token: str) -> dict[str, float]:
+    """End-of-day SOC targets (%) set on the dashboard, by ISO date.
+
+    Days whose helper is -1 or unreadable are left out (automatic).
+    """
+    today = datetime.now(WARSAW_TZ).date()
+    out: dict[str, float] = {}
+    for offset, entity in SOC_TARGET_ENTITIES.items():
+        try:
+            resp = requests.get(f"{base_url}/states/{entity}", headers=_get_headers(base_url, token), timeout=15)
+            resp.raise_for_status()
+            value = float(resp.json().get("state"))
+        except Exception:
+            continue
+        if 0 <= value <= 100:
+            out[(today + timedelta(days=offset)).isoformat()] = value
+    return out
 
 
 # ── Consumption (inverter output) ──────────────────────────────────────────
@@ -792,6 +815,7 @@ def fetch_all_data(
           - prices: list of hourly price dicts (24, 48, or padded with
                     ``is_estimated`` hours).
           - pv_correction: measured/forecast PV ratio applied to the rest of today.
+          - day_targets: dashboard end-of-day SOC targets (%) by ISO date.
           - soc: starting SOC fraction (0–1).
           - soc_source: 'bms', 'voltage' (BMS silent) or 'default' (0.5).
           - dummy_loads: net load per horizon hour (consumption − solar, ≥ 0).
@@ -845,6 +869,7 @@ def fetch_all_data(
         "solar_forecast_kwh": solar_per_hour,
         "pv_surplus_kw": pv_surplus,
         "pv_correction": pv_corr,
+        "day_targets": fetch_day_targets(base_url, token),
         "consumption_profiles": consumption["profiles"],
         "out_of_work_days": out_of_work_days,
         "horizon_dates": [d.isoformat() for d in h_dates],

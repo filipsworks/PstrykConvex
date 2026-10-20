@@ -183,6 +183,7 @@ def _get_data(
                 aux["solar_forecast_kwh"] = data.get("solar_forecast_kwh")
                 aux["pv_surplus_kw"] = data.get("pv_surplus_kw")
                 aux["pv_correction"] = data.get("pv_correction")
+                aux["day_targets"] = data.get("day_targets")
                 aux["out_of_work_days"] = data.get("out_of_work_days")
                 aux["horizon_dates"] = data.get("horizon_dates")
                 initial_soc = data["soc"]
@@ -234,7 +235,7 @@ def _run_horizon_optimization(
     prices,
     dummy_loads,
     initial_soc,
-    target_soc=None,
+    day_targets_pct: Optional[dict[str, float]] = None,
     start_hour=0,
     objective=OBJECTIVE_MIN_COST,
     horizon_dates: Optional[list[str]] = None,
@@ -247,10 +248,10 @@ def _run_horizon_optimization(
     Per-day knobs are resolved from ``overrides``:
       * Full-charge days (day-of-month in ``overrides.full_charge_days``)
         get ``max_soc=1.0`` for their hours.
-      * ``overrides.per_date_target_soc`` (else the global ``target_soc``)
-        is a floor on the SOC at the end of each day with published prices.
-    With no target (``target_soc=-1``) the plan is automatic: the cheapest
-    one that keeps the SOC above MinSOC over the whole horizon.
+      * ``day_targets_pct`` ({ISO date: %}) is a floor on the SOC at the end
+        of that day.
+    A day with no target is automatic: the cheapest plan that keeps the SOC
+    above MinSOC over the whole horizon.
 
     Returns:
         (list of per-day result dicts, horizon result from :func:`optimize`).
@@ -268,12 +269,8 @@ def _run_horizon_optimization(
     ]
     estimated = [_has_estimated_prices(prices[b * 24 : (b + 1) * 24]) for b in range(n_days)]
 
-    fallback = target_soc * 100.0 if target_soc is not None else None
-    day_targets = {}
-    for b, d in enumerate(days):
-        t = overrides.target_soc_for_date(d, fallback_pct=fallback)
-        if t is not None and not estimated[b]:  # no pins on guessed prices
-            day_targets[b] = t
+    pins = day_targets_pct or {}
+    day_targets = {b: pins[d.isoformat()] / 100.0 for b, d in enumerate(days) if d.isoformat() in pins}
 
     result = optimize(
         prices, dummy_loads, initial_soc, start_hour=start_hour, objective=objective,
@@ -306,7 +303,7 @@ def _run_horizon_optimization(
     return per_day, result
 
 
-def _plan(responses: list[dict], initial_soc: float, target_soc, min_soc_pct: float) -> Optional[dict]:
+def _plan(responses: list[dict], initial_soc: float, day_targets_pct: dict, min_soc_pct: float) -> Optional[dict]:
     """What to do with the AC breaker and the inverter, hour by hour.
 
     Not a prosumer site: grid energy only flows in (house + charging), PV
@@ -346,7 +343,7 @@ def _plan(responses: list[dict], initial_soc: float, target_soc, min_soc_pct: fl
     keys = ("start", "mode", "ac_on", "output_mode", "charger_mode", "charge_amps", "soc_pct", "price_plkwh")
     return {
         "generated_at": datetime.now(WARSAW_TZ).isoformat(timespec="seconds"),
-        "target_soc": "auto" if target_soc is None else round(target_soc * 100, 1),
+        "target_soc": {d: round(v, 1) for d, v in sorted(day_targets_pct.items())} or "auto",
         "min_soc_pct": min_soc_pct,
         "now": {k: now[k] for k in keys},
         "next_change": None if change is None else {
@@ -585,9 +582,10 @@ def optimize_endpoint():
         days            — Days of load history for the profile (default: 28)
 
     Solver knobs:
-        target_soc          — EOD SOC % (0–100) for every day with published
-                              prices, or -1/omitted = automatic (cheapest plan
-                              that never drops below min_soc_pct).
+        target_soc          — EOD SOC % (0–100) for the day the horizon names
+                              (every published day for 'available'), -1 =
+                              automatic for it. Other days take the dashboard
+                              helpers input_number.soc_target_today/_tomorrow.
         objective           — 'min_cost' or 'min_cost_per_kwh'.
 
     GBB-inspired overrides (all optional):
@@ -668,10 +666,29 @@ def optimize_endpoint():
     )
     start_hour = 0 if mock else datetime.now(WARSAW_TZ).hour
 
+    # End-of-day SOC targets: the dashboard helpers (today / tomorrow), then
+    # this request's target_soc for the day(s) it names (-1 clears), then an
+    # explicit per_date_target_soc — so the today and tomorrow sensors, each
+    # asking with its own target, still plan with both.
+    pins = dict(aux.get("day_targets") or {})
+    if target_soc_raw is not None:
+        today = datetime.now(WARSAW_TZ).date()
+        dates = aux.get("horizon_dates") or []
+        named = {
+            "today": [today.isoformat()],
+            "tomorrow": [(today + timedelta(days=1)).isoformat()],
+        }.get(horizon, [d for b, d in enumerate(dates) if not _has_estimated_prices(prices[b * 24 : (b + 1) * 24])])
+        for d in named:
+            if target_soc is None:
+                pins.pop(d, None)
+            else:
+                pins[d] = target_soc * 100.0
+    pins.update(overrides.per_date_target_soc)
+
     # One joint plan over every hour with a price (published or estimated).
     try:
         all_results, _ = _run_horizon_optimization(
-            prices, dummy_loads, initial_soc, target_soc, start_hour, objective,
+            prices, dummy_loads, initial_soc, pins, start_hour, objective,
             horizon_dates=aux.get("horizon_dates"),
             overrides=overrides,
             pv_surplus=aux.get("pv_surplus_kw"),
@@ -730,7 +747,7 @@ def optimize_endpoint():
     _record_predictions_for_response(responses, adj_meta.get("applied", False))
 
     plan = (
-        _plan(responses, initial_soc, target_soc, overrides.min_soc_pct)
+        _plan(responses, initial_soc, pins, overrides.min_soc_pct)
         if all("start" in d for r in responses for d in r["decisions"])
         else None
     )
@@ -802,7 +819,9 @@ def sensitivity_endpoint():
     if b:
         try:
             per_day, _ = _run_horizon_optimization(
-                prices, dummy_loads, initial_soc, None, start_hour=datetime.now(WARSAW_TZ).hour,
+                prices, dummy_loads, initial_soc,
+                {**(aux.get("day_targets") or {}), **overrides.per_date_target_soc},
+                start_hour=datetime.now(WARSAW_TZ).hour,
                 horizon_dates=aux.get("horizon_dates"), overrides=overrides,
                 pv_surplus=aux.get("pv_surplus_kw"),
             )

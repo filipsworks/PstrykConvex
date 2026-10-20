@@ -155,6 +155,12 @@ def main() -> None:
     assert api.fetch_actual_solar_for_date("http://x/api", "tok", today) == [None] * 24
     print("  ✓ PV actuals from counter steps (dip skipped, reset counted, flat day = None)")
 
+    # Dashboard end-of-day targets: -1 (automatic) and junk are left out.
+    helpers = {api.SOC_TARGET_ENTITIES[0]: "40.0", api.SOC_TARGET_ENTITIES[1]: "-1.0"}
+    api.requests.get = lambda url, *a, **k: _Resp({"state": helpers[url.rsplit("/", 1)[1]]})  # type: ignore[assignment]
+    assert api.fetch_day_targets("http://x/api", "tok") == {today.isoformat(): 40.0}
+    print("  ✓ dashboard SOC targets by date (-1 = automatic)")
+
     # SOC source chain: BMS (incl. last reading during a dropout) → voltage → 0.5.
     def stub(bms_states, voltage_state):
         def get(url, *a, **k):

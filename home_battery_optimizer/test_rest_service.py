@@ -23,6 +23,7 @@ TODAY = datetime.now(rs.WARSAW_TZ).date()
 DAY = [1.1, 1.0, 0.9, 0.9, 1.0, 1.1, 1.5, 1.9, 1.8, 1.3, 1.0, 0.8,
        0.7, 0.7, 0.8, 1.2, 1.6, 2.0, 2.1, 2.0, 1.8, 1.5, 1.2, 1.1]
 LOAD = [0.3] * 6 + [0.6] * 3 + [0.8] * 8 + [0.6] * 7
+HELPERS: dict = {}  # dashboard input_number targets the fake HA returns
 
 
 def fake_fetch_all_data(base_url, token, days, horizon, overrides):
@@ -32,6 +33,7 @@ def fake_fetch_all_data(base_url, token, days, horizon, overrides):
         "prices": prices, "soc": 0.4, "soc_source": "bms",
         "dummy_loads": LOAD * 2 + LOAD[:12], "raw_consumption": LOAD * 2 + LOAD[:12],
         "solar_forecast_kwh": [0.0] * 60, "pv_surplus_kw": [0.0] * 60, "pv_correction": 1.0,
+        "day_targets": dict(HELPERS),
         "out_of_work_days": [],
         "horizon_dates": [(TODAY + timedelta(days=i)).isoformat() for i in range(3)],
     }
@@ -55,7 +57,7 @@ def main() -> None:
     starts = [datetime.fromisoformat(d["start"]) for d in hours]
     assert all(b - a == timedelta(hours=1) for a, b in zip(starts, starts[1:]))
     assert all(d["mode"] in ("offgrid", "charge") and d["ac_on"] == (d["mode"] == "charge") for d in hours)
-    assert plan["now"]["start"] == hours[0]["start"] and plan["target_soc"] == 60
+    assert plan["now"]["start"] == hours[0]["start"] and plan["target_soc"] == {days[0]["date"]: 60, days[1]["date"]: 60}
     # Every charging hour sits in exactly one AC window.
     assert sum(len([d for d in hours if w["start"] <= d["start"] < w["end"]]) for w in plan["ac_windows"]) \
         == plan["totals"]["ac_hours"] == len([d for d in hours if d["ac_on"]])
@@ -73,6 +75,17 @@ def main() -> None:
     assert abs(soc_before - today["summary"]["final_soc"]) < 0.2, (soc_before, today["summary"]["final_soc"])
     sens = c.get("/sensitivity?ha_token=x&horizon=tomorrow").get_json()
     assert sens["date"] == full[1]["date"] and sens["initial_soc_pct"] == today["summary"]["final_soc"]
+
+    # Separate today / tomorrow sensors, each sending only its own target:
+    # the dashboard's today target still shapes the tomorrow request.
+    HELPERS[days[0]["date"]] = 70
+    tomorrow = c.get("/optimize?ha_token=x&horizon=tomorrow&target_soc=-1").get_json()
+    first = tomorrow["decisions"][0]
+    soc_before = first["soc_pct"] - (first["charge_wh"] + first["pv_charge_wh"] - first["discharge_wh"]) / 166.4
+    assert soc_before >= 69.9, soc_before
+    today = c.get("/optimize?ha_token=x&horizon=today&target_soc=40").get_json()
+    assert today["effective_target_soc_pct"] == 40  # the request's own day wins
+    HELPERS.clear()
 
     # Automatic target: never below MinSOC, no day pins.
     r = c.get("/optimize?ha_token=x&target_soc=-1").get_json()
