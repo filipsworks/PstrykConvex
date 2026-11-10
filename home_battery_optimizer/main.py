@@ -5,6 +5,8 @@ import json
 from datetime import date, datetime, timezone
 
 import click
+
+import config
 from api import fetch_all_data
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize
 from overrides import OptimizerOverrides, build_overrides_from_query
@@ -88,15 +90,15 @@ MOCK_DUMMY_LOADS = [
 @click.option("--mock", is_flag=True, help="Use sample data instead of API")
 @click.option(
     "--ha-url",
-    default="https://ha.kompfix.pl",
+    default=config.HA_URL,
     show_default=True,
-    help="Home Assistant base URL (e.g. https://ha.kompfix.pl). /api is appended automatically.",
+    help="Home Assistant base URL (default: HA_URL from .env). /api is appended automatically.",
 )
 @click.option(
     "--ha-token",
-    default="",
+    default=config.HA_TOKEN,
     show_default=False,
-    help="Long-lived access token (required unless --mock)",
+    help="Long-lived access token (default: HA_TOKEN from .env; required unless --mock)",
 )
 @click.option(
     "--horizon",
@@ -184,7 +186,7 @@ def main(
     # Validate: either --mock or both --ha-url and --ha-token required
     if not mock and not ha_token:
         click.echo(
-            "[error] Either --mock or --ha-token is required. Use --help for usage.",
+            "[error] Either --mock, --ha-token, or HA_TOKEN in .env is required. Use --help for usage.",
             err=True,
         )
         ctx.exit(1)

@@ -46,10 +46,11 @@ from CLI flags, REST query parameters, or JSON bodies.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
+
+import config
 
 
 @dataclass
@@ -67,10 +68,8 @@ class OptimizerOverrides:
     min_soc_pct: float = 10.0
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
-    # From the environment (.env, loaded by run.sh), not from the request.
-    price_shield: bool = field(
-        default_factory=lambda: os.environ.get("PRICE_SHIELD", "").lower() in ("true", "1", "yes", "on")
-    )
+    # From PRICE_SHIELD in .env (config.py), not from the request.
+    price_shield: bool = field(default_factory=lambda: config.env_flag("PRICE_SHIELD"))
 
     # Consumption multipliers learned from past prediction-vs-reality
     # reconciliation.  Keys are (weekday, hour); values are multipliers ≥ 0.

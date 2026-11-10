@@ -3,7 +3,7 @@ ha_api_examples/
 .venv/
 plan.md
 
-# Local settings / secrets (see home_battery_optimizer/.env.example)
+# Local settings / secrets (defaults: home_battery_optimizer/.env.defaults)
 home_battery_optimizer/.env
 
 # Python artifacts

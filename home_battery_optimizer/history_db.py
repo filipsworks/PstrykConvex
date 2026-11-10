@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+import config  # noqa: F401 — loads .env before BATTERY_HISTORY_DB is read
+
 
 # ── Connection management ──────────────────────────────────────────────────
 

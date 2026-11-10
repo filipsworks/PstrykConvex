@@ -13,6 +13,20 @@ import requests
 from websockets.sync.client import connect as ws_connect
 
 from battery_model import voltage_to_soc
+# Home Assistant entity IDs come from .env / .env.defaults (see config.py).
+from config import (
+    BATTERY_VOLTAGE_ENTITY,
+    BMS_SOC_ENTITY,
+    INVERTER_OUTPUT_POWER_ENTITY,
+    PRICE_TODAY_ENTITY,
+    PRICE_TOMORROW_ENTITY,
+    PV_ENERGY_TODAY_ENTITY,
+    PV_ENERGY_TOTAL_ENTITY,
+    SOC_TARGET_ENTITIES,
+    SOLAR_FORECAST_D2_ENTITY,
+    SOLAR_FORECAST_TODAY_ENTITY,
+    SOLAR_FORECAST_TOMORROW_ENTITY,
+)
 from overrides import OptimizerOverrides
 
 try:
@@ -23,38 +37,11 @@ except ImportError:
     WARSAW_TZ = timezone.utc  # Python < 3.9 fallback
 
 
-# ── Home Assistant entity IDs (DessMonitor integration, SandiSolar 11 kW) ──
-# Replaced the retired "Solar of Things" ``sensor.gniazdo_*`` entities in 2026-09.
-BATTERY_VOLTAGE_ENTITY = (
-    "sensor.inverter_e50000254944442369_dessmonitor_battery_voltage"
-)
-INVERTER_OUTPUT_POWER_ENTITY = (
-    "sensor.inverter_e50000254944442369_dessmonitor_output_power"
-)
 # DessMonitor reports output power in W; the whole optimizer works in kW.
 INVERTER_OUTPUT_POWER_TO_KW = 0.001
-
-# Lifetime PV yield counter (kWh, total_increasing): measured production for
-# the prediction-vs-reality reconciliation.
-PV_ENERGY_TOTAL_ENTITY = "sensor.inverter_e50000254944442369_dessmonitor_energy_total"
-
-# JK BMS (template helpers over sensor.jk_bms). The helper goes "unavailable"
-# once sensor.jk_bms has been silent for 60 s (BLE dropouts of ~8 min seen).
-BMS_SOC_ENTITY = "sensor.jk_bms_soc"
 # Oldest BMS SOC reading still trusted over the voltage estimate. At 80 A the
 # pack moves ~1 % every 2 min, so 15 min bounds the error to roughly 7 %.
 BMS_SOC_MAX_AGE_MIN = 15
-
-SOLAR_FORECAST_TODAY_ENTITY = "sensor.dom_energy_production_today"
-SOLAR_FORECAST_TOMORROW_ENTITY = "sensor.dom_energy_production_tomorrow"
-SOLAR_FORECAST_D2_ENTITY = "sensor.dom_energy_production_d2"
-# PV made per hour (hourly "change" of the daily counter) and the BMS SOC,
-# for the intraday forecast correction.
-PV_ENERGY_TODAY_ENTITY = "sensor.inverter_e50000254944442369_dessmonitor_energy_today"
-
-# Dashboard helpers holding the end-of-day SOC target (%) for today and
-# tomorrow; -1 = automatic.  Read on every run so each request plans with both.
-SOC_TARGET_ENTITIES = {0: "input_number.soc_target_today", 1: "input_number.soc_target_tomorrow"}
 
 # The "available" horizon is padded with estimated prices (the last known
 # day, hour by hour) to at least this many hours from now, so a plan made
@@ -82,7 +69,7 @@ def fetch_hourly_prices(
     """Fetch hourly prices for the requested horizon.
 
     Args:
-        base_url: HA API base URL (e.g. https://ha.kompfix.pl/api).
+        base_url: HA API base URL (e.g. https://ha.example.com/api).
         token: Long-lived access token.
         horizon: 'today', 'tomorrow', or 'available'.
                  'available' returns today + tomorrow if both are available,
@@ -137,7 +124,7 @@ def fetch_hourly_prices(
 
     def _fetch_from_main(attr_key):
         try:
-            url = f"{base_url}/states/sensor.pstryk_aio_obecna_cena_zakupu_pradu"
+            url = f"{base_url}/states/{PRICE_TODAY_ENTITY}"
             resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
             resp.raise_for_status()
             data = resp.json()
@@ -148,7 +135,7 @@ def fetch_hourly_prices(
 
     def _fetch_tomorrow_sensor():
         try:
-            url = f"{base_url}/states/sensor.pstryk_aio_cena_zakupu_pradu_jutro"
+            url = f"{base_url}/states/{PRICE_TOMORROW_ENTITY}"
             resp = requests.get(url, headers=_get_headers(base_url, token), timeout=15)
             resp.raise_for_status()
             data = resp.json()
@@ -546,9 +533,9 @@ def fetch_solar_forecast(
     """Fetch per-hour solar production forecast for today and tomorrow.
 
     Sources (attribute ``wh_period`` of each):
-      - ``sensor.dom_energy_production_today``
-      - ``sensor.dom_energy_production_tomorrow``
-      - ``sensor.dom_energy_production_d2`` (day after tomorrow)
+      - ``SOLAR_FORECAST_TODAY_ENTITY``
+      - ``SOLAR_FORECAST_TOMORROW_ENTITY``
+      - ``SOLAR_FORECAST_D2_ENTITY`` (day after tomorrow)
 
     Returns:
         dict with ``today``, ``tomorrow`` and ``d2`` keys, each a 24-element
@@ -809,7 +796,7 @@ def fetch_all_data(
     """Fetch everything the optimizer needs in one call.
 
     Args:
-        base_url: HA API base URL (e.g. https://ha.kompfix.pl/api).
+        base_url: HA API base URL (e.g. https://ha.example.com/api).
         token: Long-lived access token.
         days: Days of history for the weekday × hour consumption profile
               (default 28 — four samples of every weekday).

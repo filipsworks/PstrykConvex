@@ -15,11 +15,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_DIR="$SCRIPT_DIR"
 VENV_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/.venv"
 
-# Settings (PRICE_SHIELD, HA_URL, HA_TOKEN, ...) from .env next to this script.
-if [[ -f "$SERVICE_DIR/.env" ]]; then
-    set -a; source "$SERVICE_DIR/.env"; set +a
-fi
-
 if [[ ! -d "$VENV_DIR" ]]; then
     echo "[error] Virtual environment not found at $VENV_DIR" >&2
     exit 1

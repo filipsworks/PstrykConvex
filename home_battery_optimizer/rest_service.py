@@ -16,7 +16,6 @@ Endpoints:
 """
 
 import json
-import os
 import sys
 import threading
 import time
@@ -36,6 +35,7 @@ try:
 except ImportError:
     WARSAW_TZ = timezone
 
+import config  # noqa: E402
 from api import fetch_all_data  # noqa: E402
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize  # noqa: E402
 from overrides import OptimizerOverrides, build_overrides_from_query  # noqa: E402
@@ -123,7 +123,7 @@ def _get_data(
     ``aux`` carries the extra signals folded into the net load so callers can
     expose them in API responses:
         - raw_consumption: per-hour kW from weekday×hour history.
-        - solar_forecast_kwh: per-hour kWh from sensor.dom_energy_production_*.
+        - solar_forecast_kwh: per-hour kWh from the SOLAR_FORECAST_* entities.
         - out_of_work_days: dates (within the horizon) that are Sat/Sun/PL holiday.
         - horizon_dates: calendar date assigned to each 24-hour price block.
 
@@ -484,6 +484,14 @@ def _request_args() -> dict:
     return merged
 
 
+def _ha_credentials(args: dict) -> tuple[str, str]:
+    """HA URL and token: the request's, else HA_URL / HA_TOKEN from .env."""
+    ha_url = args.get("ha_url") or config.HA_URL
+    # The .env token goes only to the .env HA; a request naming another host brings its own.
+    default_token = config.HA_TOKEN if ha_url.rstrip("/") == config.HA_URL.rstrip("/") else ""
+    return ha_url, args.get("ha_token") or default_token
+
+
 def _apply_history_adjustments(
     overrides: OptimizerOverrides, use_adjustments: bool
 ) -> dict:
@@ -576,8 +584,8 @@ def optimize_endpoint():
 
     Connection parameters:
         mock            — Use sample data (true/false, default: false)
-        ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
-        ha_token        — HA long-lived access token (required unless mock)
+        ha_url          — Home Assistant base URL (default: HA_URL from .env)
+        ha_token        — HA long-lived access token (default: HA_TOKEN from .env)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
         days            — Days of load history for the profile (default: 28)
 
@@ -585,7 +593,7 @@ def optimize_endpoint():
         target_soc          — EOD SOC % (0–100) for the day the horizon names
                               (every published day for 'available'), -1 =
                               automatic for it. Other days take the dashboard
-                              helpers input_number.soc_target_today/_tomorrow.
+                              helpers SOC_TARGET_TODAY/TOMORROW_ENTITY (.env).
         objective           — 'min_cost' or 'min_cost_per_kwh'.
 
     GBB-inspired overrides (all optional):
@@ -609,15 +617,14 @@ def optimize_endpoint():
     """
     args = _request_args()
     mock = _parse_bool(args.get("mock")) or False
-    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
-    ha_token = args.get("ha_token", "")
+    ha_url, ha_token = _ha_credentials(args)
     horizon = args.get("horizon", "available")
     days = int(args.get("days", 28))
     target_soc_raw = args.get("target_soc")
 
     # Validate
     if not mock and not ha_token:
-        return jsonify({"error": "Either mock=true or ha_token is required"}), 400
+        return jsonify({"error": "Either mock=true, ha_token, or HA_TOKEN in .env is required"}), 400
 
     valid_horizons = ("today", "tomorrow", "available")
     if horizon not in valid_horizons:
@@ -779,21 +786,20 @@ def sensitivity_endpoint():
 
     Query parameters (subset of /optimize):
         mock            — Use sample data (true/false, default: false)
-        ha_url          — Home Assistant base URL (default: https://ha.kompfix.pl)
-        ha_token        — HA long-lived access token (required unless --mock)
+        ha_url          — Home Assistant base URL (default: HA_URL from .env)
+        ha_token        — HA long-lived access token (default: HA_TOKEN from .env)
         horizon         — Which day's prices: today/tomorrow/available (default: available)
         days            — Days of load history for the profile (default: 28)
     """
     args = _request_args()
     mock = _parse_bool(args.get("mock")) or False
-    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
-    ha_token = args.get("ha_token", "")
+    ha_url, ha_token = _ha_credentials(args)
     horizon = args.get("horizon", "available")
     days = int(args.get("days", 28))
 
     # Validate
     if not mock and not ha_token:
-        return jsonify({"error": "Either mock=true or ha_token is required"}), 400
+        return jsonify({"error": "Either mock=true, ha_token, or HA_TOKEN in .env is required"}), 400
 
     valid_horizons = ("today", "tomorrow", "available")
     if horizon not in valid_horizons:
@@ -915,21 +921,20 @@ def reconcile_endpoint():
                           (default: 1 when 'date' is not provided)
         mock            — true → skip HA fetch, just rerun reconciliation
                           against actuals already in the DB
-        ha_url          — HA base URL (default https://ha.kompfix.pl)
-        ha_token        — HA long-lived access token (required unless mock)
+        ha_url          — HA base URL (default: HA_URL from .env)
+        ha_token        — HA long-lived access token (default: HA_TOKEN from .env)
         alpha           — EWMA learning rate (default 0.25)
 
     Returns one entry per reconciled date.
     """
     args = _request_args()
     mock = _parse_bool(args.get("mock")) or False
-    ha_url = args.get("ha_url", "https://ha.kompfix.pl")
-    ha_token = args.get("ha_token", "")
+    ha_url, ha_token = _ha_credentials(args)
     alpha_raw = args.get("alpha")
     alpha = float(alpha_raw) if alpha_raw is not None else reconciliation.DEFAULT_ALPHA
 
     if not mock and not ha_token:
-        return jsonify({"error": "Either mock=true or ha_token is required"}), 400
+        return jsonify({"error": "Either mock=true, ha_token, or HA_TOKEN in .env is required"}), 400
 
     date_str = args.get("date")
     days_back_raw = args.get("days_back")
@@ -1038,7 +1043,7 @@ def reconciliation_log_endpoint():
 RECONCILE_HOUR = 3  # Warsaw local
 
 # HA credentials of the last live /optimize call (HA polls it hourly), unless
-# HA_URL / HA_TOKEN are set in the environment.  Kept in memory only.
+# HA_URL / HA_TOKEN are set in .env.  Kept in memory only.
 _last_ha: dict = {}
 
 
@@ -1055,8 +1060,11 @@ def _nightly_reconcile() -> None:
     """Every night: pull yesterday's actuals from HA and update the learned multipliers."""
     while True:
         time.sleep(_seconds_until(RECONCILE_HOUR))
-        url = os.environ.get("HA_URL") or _last_ha.get("url")
-        token = os.environ.get("HA_TOKEN") or _last_ha.get("token")
+        # Keep URL and token paired: .env's, else the last live call's.
+        url, token = (
+            (config.HA_URL, config.HA_TOKEN) if config.HA_TOKEN
+            else (_last_ha.get("url"), _last_ha.get("token"))
+        )
         if not (url and token):
             print("[reconcile] skipped: no HA credentials yet (HA_URL/HA_TOKEN or a live /optimize call)",
                   file=sys.stderr)

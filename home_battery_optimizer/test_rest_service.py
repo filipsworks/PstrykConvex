@@ -92,6 +92,13 @@ def main() -> None:
     assert r["plan"]["target_soc"] == "auto"
     assert r["plan"]["totals"]["min_soc_pct"] >= 10 - 0.1
     assert all("effective_target_soc_pct" not in d for d in r["days"])
+    # The .env token goes only to the .env HA, never to a host the request names.
+    saved, rs.config.HA_TOKEN = rs.config.HA_TOKEN, "T"
+    assert rs._ha_credentials({}) == (rs.config.HA_URL, "T")
+    assert rs._ha_credentials({"ha_url": "https://other.example"}) == ("https://other.example", "")
+    assert rs._ha_credentials({"ha_url": "https://other.example", "ha_token": "X"})[1] == "X"
+    rs.config.HA_TOKEN = saved
+
     print("rest_service self-check OK")
 
 

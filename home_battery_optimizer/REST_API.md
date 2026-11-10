@@ -25,6 +25,34 @@ uvicorn rest_service:asgi_app --host 0.0.0.0 --port 8000
 
 The server starts on `http://<host>:<port>`.
 
+## Configuration (`.env`)
+
+Installation settings live in `home_battery_optimizer/.env.defaults`
+(committed, every key with its default) and `home_battery_optimizer/.env`
+(git-ignored, local values and secrets, wins over the defaults).  A variable
+already set in the process environment wins over both.  `config.py` loads
+them at import, so the service and the CLI see the same values.  Restart the
+service after a change.
+
+| Key | Meaning |
+|---|---|
+| `HA_URL` | Home Assistant base URL (without `/api`); default for `ha_url` |
+| `HA_TOKEN` | Long-lived access token; default for `ha_token`. Keep it in `.env` only |
+| `PRICE_TODAY_ENTITY`, `PRICE_TOMORROW_ENTITY` | Pstryk AIO purchase price sensors |
+| `PRICE_SHIELD` | `true` = plan with the shielded purchase price (see below) |
+| `BATTERY_VOLTAGE_ENTITY`, `INVERTER_OUTPUT_POWER_ENTITY`, `PV_ENERGY_TOTAL_ENTITY`, `PV_ENERGY_TODAY_ENTITY` | Inverter (DessMonitor) sensors |
+| `BMS_SOC_ENTITY` | JK BMS SOC |
+| `SOLAR_FORECAST_TODAY_ENTITY`, `SOLAR_FORECAST_TOMORROW_ENTITY`, `SOLAR_FORECAST_D2_ENTITY` | PV forecast sensors |
+| `SOC_TARGET_TODAY_ENTITY`, `SOC_TARGET_TOMORROW_ENTITY` | Dashboard end-of-day SOC target helpers |
+| `BATTERY_HISTORY_DB` | SQLite prediction store; empty = `home_battery_optimizer/data/history.db` |
+
+**Price shield.** `PRICE_SHIELD=true` makes every run plan with the shielded
+purchase price: each hour's `price_shield` attribute from the Pstryk AIO price
+sensors (energy part capped by the shield, distribution and taxes unchanged)
+replaces `price`.  Hours without the attribute keep the full price and log a
+`[warn]`.  `price_plkwh` and costs in the response follow the chosen price;
+`overrides_active.price_shield` shows the setting.  Default `false`.
+
 ## Persistence (auto-restart)
 
 The service includes a `run.sh` wrapper that automatically uses **supervisor** for crash recovery when it's installed. Supervisor restarts the process on exit, crash, or abnormal termination.
@@ -71,21 +99,10 @@ The service automatically records every `/optimize` run's per-hour predictions
 reconciles the previous day by itself: it pulls the actuals from Home
 Assistant, compares them against the recorded predictions, and
 exponentially smooths a learned multiplier per `(weekday, hour)` bucket
-into the `adjustments` table.  It uses `HA_URL` / `HA_TOKEN` from the
-environment when set, otherwise the credentials of the last live
+into the `adjustments` table.  It uses `HA_URL` / `HA_TOKEN` from
+`.env` when set, otherwise the credentials of the last live
 `/optimize` call (kept in memory only).  `/reconcile` stays available for
 manual runs and back-fills.
-
-### Price shield (`.env`)
-
-`run.sh` loads `home_battery_optimizer/.env` (if present) into the service's
-environment; copy `.env.example` to start.  `PRICE_SHIELD=true` makes every
-run plan with the shielded purchase price: each hour's `price_shield`
-attribute from the Pstryk AIO price sensors (energy part capped by the shield,
-distribution and taxes unchanged) replaces `price`.  Hours without the
-attribute keep the full price and log a `[warn]`.  `price_plkwh` and costs in
-the response follow the chosen price; `overrides_active.price_shield` shows
-the setting.  Default `false`.  Restart the service after editing `.env`.
 
 Subsequent `/optimize` / `/sensitivity` calls apply the consumption
 multipliers by default (PV has no learned factor — see *Prediction inputs*) — pass `use_adjustments=false` to skip the lookup and get the
@@ -117,8 +134,8 @@ Run the charging optimization and return JSON results.
 | Parameter | Type | Default | Required | Description |
 |---|---|---|---|---|
 | `mock` | boolean | `false` | No (unless no token) | Use sample data instead of Home Assistant API |
-| `ha_url` | string | `https://ha.kompfix.pl` | No | Home Assistant base URL (without `/api`) |
-| `ha_token` | string | *(none)* | Yes (if `mock=false`) | Long-lived access token for Home Assistant |
+| `ha_url` | string | `HA_URL` (`.env`) | No | Home Assistant base URL (without `/api`) |
+| `ha_token` | string | `HA_TOKEN` (`.env`) | Yes (if `mock=false` and no `HA_TOKEN`) | Long-lived access token for Home Assistant |
 | `horizon` | enum | `available` | No | Which day(s) to return. The plan always covers today + tomorrow once published, padded with **estimated** hours (the last known day repeated) to at least 36 h ahead and to the end of tomorrow, solved as **one** plan from now. `available` returns every day; `today` / `tomorrow` return just that day of the same plan — so tomorrow starts from the SOC the plan reaches at midnight. |
 | `days` | integer | `28` | No | Days of load history for the weekday×hour profile (28 = four samples of every weekday) |
 | `target_soc` | float | *(dashboard)* | No | EOD SOC % (0–100) for the day `horizon` names (`today` / `tomorrow`; every published day for `available`). `-1` = **automatic** for that day: the cheapest plan that never lets the SOC drop below `min_soc_pct`. Days the request does not name take the dashboard helpers `input_number.soc_target_today` / `_tomorrow`, read from HA on every run — so the today and tomorrow sensors, each sending only its own target, plan with both. Beaten by `per_date_target_soc` for matching dates. |
@@ -391,8 +408,8 @@ Run sensitivity analysis: grid cost vs target SOC across the active SOC band (`m
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mock` | boolean | `false` | Use sample data |
-| `ha_url` | string | `https://ha.kompfix.pl` | Home Assistant base URL |
-| `ha_token` | string | *(none)* | HA token (required if `mock=false`) |
+| `ha_url` | string | `HA_URL` (`.env`) | Home Assistant base URL |
+| `ha_token` | string | `HA_TOKEN` (`.env`) | HA token (required if `mock=false` and no `HA_TOKEN`) |
 | `horizon` | enum | `available` | Which day's prices: `today`, `tomorrow`, `available` |
 | `days` | integer | `28` | Days of load history for the profile |
 
@@ -508,8 +525,8 @@ divide-by-zero blow-ups.
 | `date` | string (`YYYY-MM-DD`) | *(none)* | Reconcile exactly this date |
 | `days_back` | int | `1` | If `date` is omitted: reconcile the last N completed days |
 | `mock` | boolean | `false` | Skip the HA fetch — just reconcile against actuals already in the DB |
-| `ha_url` | string | `https://ha.kompfix.pl` | HA base URL |
-| `ha_token` | string | *(none)* | Required unless `mock=true` |
+| `ha_url` | string | `HA_URL` (`.env`) | HA base URL |
+| `ha_token` | string | `HA_TOKEN` (`.env`) | Required unless `mock=true` or `HA_TOKEN` is set |
 | `alpha` | float | `0.25` | EWMA learning rate (higher = faster adapt, more jitter) |
 
 **Response:**
