@@ -76,6 +76,17 @@ environment when set, otherwise the credentials of the last live
 `/optimize` call (kept in memory only).  `/reconcile` stays available for
 manual runs and back-fills.
 
+### Price shield (`.env`)
+
+`run.sh` loads `home_battery_optimizer/.env` (if present) into the service's
+environment; copy `.env.example` to start.  `PRICE_SHIELD=true` makes every
+run plan with the shielded purchase price: each hour's `price_shield`
+attribute from the Pstryk AIO price sensors (energy part capped by the shield,
+distribution and taxes unchanged) replaces `price`.  Hours without the
+attribute keep the full price and log a `[warn]`.  `price_plkwh` and costs in
+the response follow the chosen price; `overrides_active.price_shield` shows
+the setting.  Default `false`.  Restart the service after editing `.env`.
+
 Subsequent `/optimize` / `/sensitivity` calls apply the consumption
 multipliers by default (PV has no learned factor — see *Prediction inputs*) — pass `use_adjustments=false` to skip the lookup and get the
 raw, unadjusted result (e.g. for "what would the unadjusted optimizer do?"
@@ -130,7 +141,6 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 | `solar_scale` | float | `1.0` | PV forecast correction factor (GBB-style auto-calibrated drift correction). |
 | `solar_override_kwh` | csv | *(empty)* | CSV of kWh-per-hour values; replaces the PV forecast entirely. |
 | `dry_run` | boolean | `false` | Marks the response as advisory (`advisory: true`). Numbers are unchanged; the caller should NOT send decisions to the inverter. |
-| `price_shield` | boolean | `false` | Plan with the shielded purchase price: each hour's `price_shield` attribute from the Pstryk AIO price sensors (energy part capped by the shield, distribution and taxes unchanged) replaces `price`. Hours without the attribute keep the full price and log a `[warn]`. `price_plkwh` and costs in the response follow the chosen price. |
 
 > **Layering order** (applied in `_build_net_load`):
 > 1. `consumption_profile` replaces the auto-learned weekday map.

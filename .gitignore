@@ -3,6 +3,9 @@ ha_api_examples/
 .venv/
 plan.md
 
+# Local settings / secrets (see home_battery_optimizer/.env.example)
+home_battery_optimizer/.env
+
 # Python artifacts
 __pycache__/
 *.py[cod]

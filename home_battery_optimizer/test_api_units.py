@@ -12,6 +12,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -206,9 +207,12 @@ def main() -> None:
     assert [p["price"] for p in api.fetch_hourly_prices("http://x/api", "tok", "today")] == [3.0] * 24
     shielded = [p["price"] for p in api.fetch_hourly_prices("http://x/api", "tok", "today", use_shield=True)]
     assert shielded[5] == 3.0 and shielded[:5] == [1.29] * 5 and shielded[6:] == [1.29] * 18
-    assert overrides_mod.build_overrides_from_query({"price_shield": "true"}).price_shield
-    assert not overrides_mod.build_overrides_from_query({}).price_shield
-    print("  ✓ price_shield used only on request; missing hours keep the full price")
+    os.environ.pop("PRICE_SHIELD", None)
+    assert not overrides_mod.build_overrides_from_query({"price_shield": "true"}).price_shield
+    os.environ["PRICE_SHIELD"] = "true"
+    assert overrides_mod.build_overrides_from_query({}).price_shield
+    del os.environ["PRICE_SHIELD"]
+    print("  ✓ price_shield from PRICE_SHIELD env only; missing hours keep the full price")
 
     print("\nAll checks passed.")
 

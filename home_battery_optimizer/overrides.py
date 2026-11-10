@@ -37,6 +37,7 @@ installation. The exposed knobs are:
 * ``price_shield``          — plan with the shielded purchase price (Pstryk AIO
                               ``price_shield`` attribute: energy part capped by
                               the shield) instead of the full market price.
+                              Set by ``PRICE_SHIELD`` in ``.env``, not per request.
 
 Parsing helpers accept simple text formats so the same overrides can come
 from CLI flags, REST query parameters, or JSON bodies.
@@ -45,6 +46,7 @@ from CLI flags, REST query parameters, or JSON bodies.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -65,7 +67,10 @@ class OptimizerOverrides:
     min_soc_pct: float = 10.0
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
-    price_shield: bool = False
+    # From the environment (.env, loaded by run.sh), not from the request.
+    price_shield: bool = field(
+        default_factory=lambda: os.environ.get("PRICE_SHIELD", "").lower() in ("true", "1", "yes", "on")
+    )
 
     # Consumption multipliers learned from past prediction-vs-reality
     # reconciliation.  Keys are (weekday, hour); values are multipliers ≥ 0.
@@ -335,7 +340,6 @@ def build_overrides_from_query(args: dict) -> OptimizerOverrides:
         min_soc_pct=_f("min_soc_pct", 10.0),
         per_date_target_soc=parse_per_date_target_soc(args.get("per_date_target_soc")),
         dry_run=_b("dry_run", False),
-        price_shield=_b("price_shield", False),
     )
 
     if not (0.0 < ov.consumption_scale <= 10.0):

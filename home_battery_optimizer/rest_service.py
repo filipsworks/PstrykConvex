@@ -602,8 +602,6 @@ def optimize_endpoint():
         dry_run             — true → response carries advisory=true; no semantic
                               change to numbers, but the dashboard / caller can
                               choose not to push the decisions to the inverter.
-        price_shield        — true → plan with the shield-capped purchase price
-                              (Pstryk AIO ``price_shield``); default false.
 
     Examples:
         GET  /optimize?mock=true&full_charge_days=1,15&max_soc_pct=90
