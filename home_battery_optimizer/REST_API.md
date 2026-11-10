@@ -130,6 +130,7 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 | `solar_scale` | float | `1.0` | PV forecast correction factor (GBB-style auto-calibrated drift correction). |
 | `solar_override_kwh` | csv | *(empty)* | CSV of kWh-per-hour values; replaces the PV forecast entirely. |
 | `dry_run` | boolean | `false` | Marks the response as advisory (`advisory: true`). Numbers are unchanged; the caller should NOT send decisions to the inverter. |
+| `price_shield` | boolean | `false` | Plan with the shielded purchase price: each hour's `price_shield` attribute from the Pstryk AIO price sensors (energy part capped by the shield, distribution and taxes unchanged) replaces `price`. Hours without the attribute keep the full price and log a `[warn]`. `price_plkwh` and costs in the response follow the chosen price. |
 
 > **Layering order** (applied in `_build_net_load`):
 > 1. `consumption_profile` replaces the auto-learned weekday map.
@@ -213,7 +214,8 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
     "max_soc_pct": 95.0,
     "min_soc_pct": 10.0,
     "per_date_target_soc": {"2026-05-19": 80},
-    "dry_run": false
+    "dry_run": false,
+    "price_shield": false
   },
   "pv_correction_today": 0.82,
   "decisions": [

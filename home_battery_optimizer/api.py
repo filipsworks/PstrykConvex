@@ -4,6 +4,7 @@ solar forecast, and Polish out-of-work days."""
 import json
 import re
 import statistics
+import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -76,7 +77,7 @@ def _get_headers(base_url: str, token: str) -> dict:
 
 
 def fetch_hourly_prices(
-    base_url: str, token: str, horizon: str = "available"
+    base_url: str, token: str, horizon: str = "available", use_shield: bool = False
 ) -> list[dict]:
     """Fetch hourly prices for the requested horizon.
 
@@ -86,6 +87,9 @@ def fetch_hourly_prices(
         horizon: 'today', 'tomorrow', or 'available'.
                  'available' returns today + tomorrow if both are available,
                  otherwise just the day that has data.
+        use_shield: Take each hour's ``price_shield`` (shield-capped price
+                    from Pstryk AIO) as ``price``; hours without it keep
+                    the full price.
 
     Returns:
         List of 24 or 48 dicts with keys: hour, price (PLN/kWh), is_cheap,
@@ -94,12 +98,16 @@ def fetch_hourly_prices(
 
     def _parse_price_list(raw_prices, is_estimated):
         result = []
+        missing_shield = 0
         for p in raw_prices:
             start_dt = datetime.fromisoformat(p["start"])
             hour = start_dt.hour
+            price = p.get("price_shield") if use_shield else None
+            if use_shield and price is None:
+                missing_shield += 1
             entry = {
                 "hour": hour,
-                "price": float(p["price"]),
+                "price": float(p["price"] if price is None else price),
                 "is_cheap": bool(p.get("is_cheap", False)),
                 "is_expensive": bool(p.get("is_expensive", False)),
             }
@@ -107,6 +115,9 @@ def fetch_hourly_prices(
                 entry["is_estimated"] = True
             result.append(entry)
 
+        if missing_shield:
+            print(f"[warn] price_shield missing for {missing_shield} h — full price used there",
+                  file=sys.stderr)
         result.sort(key=lambda x: x["hour"])
         avg_price = sum(p["price"] for p in result) / len(result) if result else 1.0
 
@@ -833,7 +844,7 @@ def fetch_all_data(
         overrides = OptimizerOverrides()
 
     now = datetime.now(WARSAW_TZ)
-    prices = fetch_hourly_prices(base_url, token, horizon=horizon)
+    prices = fetch_hourly_prices(base_url, token, horizon=horizon, use_shield=overrides.price_shield)
     if horizon == "available" and prices:
         # At least to tomorrow's midnight, so tomorrow is always a whole day.
         prices = _pad_with_estimates(prices, max(now.hour + MIN_HORIZON_H, 48))

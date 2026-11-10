@@ -20,6 +20,7 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 
 import api  # noqa: E402
+import overrides as overrides_mod  # noqa: E402
 
 
 class _Resp:
@@ -196,6 +197,18 @@ def main() -> None:
     net, _, _, _ = api._build_net_load(prices, consumption, solar, [today + timedelta(days=2)])
     assert net[0] == 0.5, net[0]
     print("  ✓ PV surplus split out and taken from the matching day's forecast (incl. D+2)")
+
+    # Shield: price_shield replaces price only when asked; a missing one keeps price.
+    frames = [{"start": f"2026-11-10T{h:02d}:00:00+01:00", "price": 3.0, "price_shield": 1.29}
+              for h in range(24)]
+    del frames[5]["price_shield"]
+    api.requests.get = lambda *a, **k: _Resp({"attributes": {"today_prices": frames}})  # type: ignore[assignment]
+    assert [p["price"] for p in api.fetch_hourly_prices("http://x/api", "tok", "today")] == [3.0] * 24
+    shielded = [p["price"] for p in api.fetch_hourly_prices("http://x/api", "tok", "today", use_shield=True)]
+    assert shielded[5] == 3.0 and shielded[:5] == [1.29] * 5 and shielded[6:] == [1.29] * 18
+    assert overrides_mod.build_overrides_from_query({"price_shield": "true"}).price_shield
+    assert not overrides_mod.build_overrides_from_query({}).price_shield
+    print("  ✓ price_shield used only on request; missing hours keep the full price")
 
     print("\nAll checks passed.")
 

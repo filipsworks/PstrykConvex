@@ -34,6 +34,9 @@ installation. The exposed knobs are:
 * ``dry_run``               — flag the response as advisory; the caller is
                               expected NOT to send the decisions to the
                               inverter.  Mirrors GBB Test mode.
+* ``price_shield``          — plan with the shielded purchase price (Pstryk AIO
+                              ``price_shield`` attribute: energy part capped by
+                              the shield) instead of the full market price.
 
 Parsing helpers accept simple text formats so the same overrides can come
 from CLI flags, REST query parameters, or JSON bodies.
@@ -62,6 +65,7 @@ class OptimizerOverrides:
     min_soc_pct: float = 10.0
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
+    price_shield: bool = False
 
     # Consumption multipliers learned from past prediction-vs-reality
     # reconciliation.  Keys are (weekday, hour); values are multipliers ≥ 0.
@@ -110,6 +114,7 @@ class OptimizerOverrides:
             "min_soc_pct": self.min_soc_pct,
             "per_date_target_soc": self.per_date_target_soc,
             "dry_run": self.dry_run,
+            "price_shield": self.price_shield,
             "consumption_adjustment_buckets": (
                 len(self.consumption_adjustment)
                 if self.consumption_adjustment is not None
@@ -330,6 +335,7 @@ def build_overrides_from_query(args: dict) -> OptimizerOverrides:
         min_soc_pct=_f("min_soc_pct", 10.0),
         per_date_target_soc=parse_per_date_target_soc(args.get("per_date_target_soc")),
         dry_run=_b("dry_run", False),
+        price_shield=_b("price_shield", False),
     )
 
     if not (0.0 < ov.consumption_scale <= 10.0):
