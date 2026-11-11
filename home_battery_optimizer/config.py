@@ -21,11 +21,20 @@ def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("true", "1", "yes", "on")
 
 
+def price_shield() -> bool | str:
+    """PRICE_SHIELD from the environment, read at call time: True, False or
+    "auto" (decided on every run from PRICE_MONTHLY_AVG_ENTITY, see api.py)."""
+    if os.environ.get("PRICE_SHIELD", "").strip().lower() == "auto":
+        return "auto"
+    return env_flag("PRICE_SHIELD")
+
+
 HA_URL = os.environ["HA_URL"]
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 
 PRICE_TODAY_ENTITY = os.environ["PRICE_TODAY_ENTITY"]
 PRICE_TOMORROW_ENTITY = os.environ["PRICE_TOMORROW_ENTITY"]
+PRICE_MONTHLY_AVG_ENTITY = os.environ["PRICE_MONTHLY_AVG_ENTITY"]
 
 BATTERY_VOLTAGE_ENTITY = os.environ["BATTERY_VOLTAGE_ENTITY"]
 INVERTER_OUTPUT_POWER_ENTITY = os.environ["INVERTER_OUTPUT_POWER_ENTITY"]

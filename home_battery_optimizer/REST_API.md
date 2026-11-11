@@ -39,7 +39,8 @@ service after a change.
 | `HA_URL` | Home Assistant base URL (without `/api`); default for `ha_url` |
 | `HA_TOKEN` | Long-lived access token; default for `ha_token`. Keep it in `.env` only |
 | `PRICE_TODAY_ENTITY`, `PRICE_TOMORROW_ENTITY` | Pstryk AIO purchase price sensors |
-| `PRICE_SHIELD` | `true` = plan with the shielded purchase price (see below) |
+| `PRICE_SHIELD` | `true` = plan with the shielded purchase price, `auto` = only while the shield is active (see below) |
+| `PRICE_MONTHLY_AVG_ENTITY` | For `PRICE_SHIELD=auto`: monthly average energy purchase price, with the shield price in its `price_shield` attribute |
 | `BATTERY_VOLTAGE_ENTITY`, `INVERTER_OUTPUT_POWER_ENTITY`, `PV_ENERGY_TOTAL_ENTITY`, `PV_ENERGY_TODAY_ENTITY` | Inverter (DessMonitor) sensors |
 | `BMS_SOC_ENTITY` | JK BMS SOC |
 | `SOLAR_FORECAST_TODAY_ENTITY`, `SOLAR_FORECAST_TOMORROW_ENTITY`, `SOLAR_FORECAST_D2_ENTITY` | PV forecast sensors |
@@ -55,6 +56,13 @@ sensors (energy part capped by the shield, distribution and taxes unchanged)
 replaces `price`.  Hours without the attribute keep the full price and log a
 `[warn]`.  `price_plkwh` and costs in the response follow the chosen price;
 `overrides_active.price_shield` shows the setting.  Default `false`.
+
+`PRICE_SHIELD=auto` decides on every run: the shield counts as active while
+the state of `PRICE_MONTHLY_AVG_ENTITY` (monthly average energy purchase
+price) is above that entity's `price_shield` attribute (the shield price),
+e.g. `1.2332` > `0.61`.  `overrides_active.price_shield` then shows the
+outcome, `true` or `false`.  If the entity cannot be read the run plans with
+the full price and logs a `[warn]`.
 
 ## Persistence (auto-restart)
 

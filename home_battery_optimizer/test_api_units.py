@@ -214,6 +214,34 @@ def main() -> None:
     del os.environ["PRICE_SHIELD"]
     print("  ✓ price_shield from PRICE_SHIELD env only; missing hours keep the full price")
 
+    # PRICE_SHIELD=auto: on only while the monthly average energy price is
+    # above the shield price; an entity that cannot be read counts as off.
+    os.environ["PRICE_SHIELD"] = "auto"
+    assert overrides_mod.build_overrides_from_query({}).price_shield == "auto"
+    del os.environ["PRICE_SHIELD"]
+    for state, active in (("1.2332", True), ("0.61", False), ("0.55", False), ("unavailable", False)):
+        api.requests.get = lambda *a, _s=state, **k: _Resp({"state": _s, "attributes": {"price_shield": 0.61}})  # type: ignore[assignment]
+        assert api.fetch_shield_active("http://x/api", "tok") is active, state
+    api.requests.get = lambda *a, **k: _Resp({"state": "1.2332", "attributes": {}})  # type: ignore[assignment]
+    assert api.fetch_shield_active("http://x/api", "tok") is False  # no shield price to compare with
+
+    # ... and the run then plans with the price that outcome picks.
+    def ha(average):
+        def get(url, *a, **k):
+            if "/history/" in url:
+                return _Resp([])
+            if api.PRICE_MONTHLY_AVG_ENTITY in url:
+                return _Resp({"state": average, "attributes": {"price_shield": 0.61}})
+            return _Resp({"state": "unknown", "attributes": {"today_prices": frames}})
+        api.requests.get = get  # type: ignore[assignment]
+
+    for average, active, price in (("1.2332", True, 1.29), ("0.55", False, 3.0)):
+        ha(average)
+        ov = api.OptimizerOverrides(price_shield="auto")
+        data = api.fetch_all_data("http://x/api", "tok", overrides=ov)
+        assert ov.price_shield is active and data["prices"][0]["price"] == price, (average, ov.price_shield)
+    print("  ✓ PRICE_SHIELD=auto: shield on while the monthly average is above the shield price")
+
     print("\nAll checks passed.")
 
 

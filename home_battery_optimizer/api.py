@@ -18,6 +18,7 @@ from config import (
     BATTERY_VOLTAGE_ENTITY,
     BMS_SOC_ENTITY,
     INVERTER_OUTPUT_POWER_ENTITY,
+    PRICE_MONTHLY_AVG_ENTITY,
     PRICE_TODAY_ENTITY,
     PRICE_TOMORROW_ENTITY,
     PV_ENERGY_TODAY_ENTITY,
@@ -176,6 +177,27 @@ def fetch_hourly_prices(
 
         # Both available — concatenate (today + tomorrow)
         return today_prices + tomorrow_prices
+
+
+def fetch_shield_active(base_url: str, token: str) -> bool:
+    """``PRICE_SHIELD=auto``: is the price shield active right now?
+
+    It is while the monthly average energy price (state of
+    :data:`PRICE_MONTHLY_AVG_ENTITY`) is above the shield price (that
+    entity's ``price_shield`` attribute).  When the entity cannot be read the
+    shield counts as off and a ``[warn]`` is logged.
+    """
+    try:
+        resp = requests.get(
+            f"{base_url}/states/{PRICE_MONTHLY_AVG_ENTITY}", headers=_get_headers(base_url, token), timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return float(data["state"]) > float(data["attributes"]["price_shield"])
+    except Exception as e:
+        print(f"[warn] PRICE_SHIELD=auto: cannot read {PRICE_MONTHLY_AVG_ENTITY} ({e!r}) — planning with the full price",
+              file=sys.stderr)
+        return False
 
 
 # ── Battery ────────────────────────────────────────────────────────────────
@@ -832,6 +854,9 @@ def fetch_all_data(
         overrides = OptimizerOverrides()
 
     now = datetime.now(WARSAW_TZ)
+    if overrides.price_shield == "auto":
+        # Kept on the overrides so the response shows what this run planned with.
+        overrides.price_shield = fetch_shield_active(base_url, token)
     prices = fetch_hourly_prices(base_url, token, horizon=horizon, use_shield=overrides.price_shield)
     if horizon == "available" and prices:
         # At least to tomorrow's midnight, so tomorrow is always a whole day.

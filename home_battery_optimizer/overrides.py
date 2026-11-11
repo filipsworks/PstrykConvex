@@ -39,7 +39,9 @@ installation. The exposed knobs are:
 * ``price_shield``          — plan with the shielded purchase price (Pstryk AIO
                               ``price_shield`` attribute: energy part capped by
                               the shield) instead of the full market price.
-                              Set by ``PRICE_SHIELD`` in ``.env``, not per request.
+                              Set by ``PRICE_SHIELD`` in ``.env``, not per request:
+                              ``true``, ``false`` or ``auto`` (on only while
+                              the shield is active, decided on every run).
 
 Parsing helpers accept simple text formats so the same overrides can come
 from CLI flags, REST query parameters, or JSON bodies.
@@ -71,8 +73,9 @@ class OptimizerOverrides:
     min_soc_pct: float = MIN_SOC_PCT
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
-    # From PRICE_SHIELD in .env (config.py), not from the request.
-    price_shield: bool = field(default_factory=lambda: config.env_flag("PRICE_SHIELD"))
+    # From PRICE_SHIELD in .env (config.py), not from the request. "auto"
+    # becomes True or False in api.fetch_all_data, once HA has been asked.
+    price_shield: bool | str = field(default_factory=lambda: config.price_shield())
 
     # Consumption multipliers learned from past prediction-vs-reality
     # reconciliation.  Keys are (weekday, hour); values are multipliers ≥ 0.
