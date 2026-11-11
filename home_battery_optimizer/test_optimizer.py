@@ -178,6 +178,19 @@ def check_cheapest_hour_full_first():
     assert r["decisions"][-1]["charge_amps"] == 80 and r["summary"]["target_reached"], r["decisions"]
 
 
+def check_first_hour_fraction():
+    # A plan made at 22:30 has half of that hour left: 80 A moves 12.5 % of
+    # SOC there, not 25 %, and costs half; the next hour is a whole one.
+    r = optimize(_prices(PRICES), LOAD, 0.10, target_soc=0.9, start_hour=22, first_hour_fraction=0.5)
+    first, second = r["decisions"]
+    assert first["charge_amps"] == second["charge_amps"] == 80, r["decisions"]
+    assert first["charge_wh"] == 2080 and second["charge_wh"] == 4160, r["decisions"]
+    assert abs(first["soc_pct"] - 22.5) < 0.05 and abs(second["soc_pct"] - 47.5) < 0.05, r["decisions"]
+    grid_kw = LOAD[22] + 80 * NOMINAL_VOLTAGE / 1000 / CHARGE_EFFICIENCY
+    assert abs(first["grid_kwh"] - grid_kw / 2) < 1e-3, (first, grid_kw)
+    assert abs(first["grid_cost_pln"] - PRICES[22] * grid_kw / 2) < 1e-3, first
+
+
 def check_min_cost_per_kwh_still_works():
     r = optimize(_prices(PRICES), LOAD, 0.30, objective=OBJECTIVE_MIN_COST_PER_KWH)
     assert r["chosen_target_soc_pct"] is not None
@@ -194,5 +207,6 @@ if __name__ == "__main__":
     check_joint_horizon_sees_tomorrow()
     check_day_targets()
     check_cheapest_hour_full_first()
+    check_first_hour_fraction()
     check_min_cost_per_kwh_still_works()
     print("optimizer self-check OK")

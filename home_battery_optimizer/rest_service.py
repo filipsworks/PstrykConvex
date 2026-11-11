@@ -186,6 +186,7 @@ def _get_data(
                 aux["day_targets"] = data.get("day_targets")
                 aux["out_of_work_days"] = data.get("out_of_work_days")
                 aux["horizon_dates"] = data.get("horizon_dates")
+                aux["day_types"] = data.get("day_types")
                 initial_soc = data["soc"]
                 aux["soc_source"] = data["soc_source"]
                 if data["soc_source"] != "bms":
@@ -231,6 +232,13 @@ def _has_estimated_prices(prices):
     return any(p.get("is_estimated", False) for p in prices)
 
 
+def _hour_left(now: datetime) -> float:
+    """Part of the running hour still ahead: a plan made mid-hour must not
+    count on energy that hour can no longer move."""
+    # shortcut: the CLI (main.py) still plans the running hour as a whole one, pass this there if it ever drives the inverter.
+    return (60 - now.minute) / 60
+
+
 def _run_horizon_optimization(
     prices,
     dummy_loads,
@@ -241,6 +249,7 @@ def _run_horizon_optimization(
     horizon_dates: Optional[list[str]] = None,
     overrides: Optional[OptimizerOverrides] = None,
     pv_surplus: Optional[list[float]] = None,
+    first_hour_fraction: float = 1.0,
 ):
     """Optimise the whole horizon — rest of today, tomorrow, estimated hours —
     as one plan, then split it per calendar day.
@@ -276,6 +285,7 @@ def _run_horizon_optimization(
         prices, dummy_loads, initial_soc, start_hour=start_hour, objective=objective,
         max_soc=[day_max[i // 24] for i in range(len(prices))],
         min_soc=overrides.min_soc(), pv_surplus_kw=pv_surplus, day_targets=day_targets,
+        first_hour_fraction=first_hour_fraction,
     )
 
     per_day = []
@@ -368,6 +378,7 @@ def _plan(responses: list[dict], initial_soc: float, day_targets_pct: dict, min_
 def _run_sensitivity(
     prices, dummy_loads, initial_soc, start_hour=0,
     max_soc: float = 0.95, min_soc: float = 0.10, pv_surplus=None,
+    first_hour_fraction: float = 1.0,
 ):
     """Run sensitivity analysis: unconstrained baseline + target SOC sweep.
 
@@ -383,6 +394,7 @@ def _run_sensitivity(
             baseline_result = optimize(
                 prices, dummy_loads, initial_soc, target_soc=None, start_hour=start_hour,
                 max_soc=max_soc, min_soc=min_soc, pv_surplus_kw=pv_surplus,
+                first_hour_fraction=first_hour_fraction,
             )
             baseline_cost_pln = baseline_result["summary"]["total_cost_pln"]
             baseline_grid_kwh = baseline_result["summary"]["total_grid_kwh"]
@@ -415,6 +427,7 @@ def _run_sensitivity(
                     max_soc=max_soc,
                     min_soc=min_soc,
                     pv_surplus_kw=pv_surplus,
+                    first_hour_fraction=first_hour_fraction,
                 )
                 summary = result["summary"]
                 if not summary["target_reached"]:
@@ -520,7 +533,10 @@ def _apply_history_adjustments(
 
 
 def _record_predictions_for_response(
-    responses: list[dict], adjustments_applied: bool
+    responses: list[dict],
+    adjustments_applied: bool,
+    overrides: OptimizerOverrides,
+    day_types: dict[str, int],
 ) -> None:
     """Persist per-hour predictions from a successful /optimize response.
 
@@ -528,6 +544,11 @@ def _record_predictions_for_response(
     day with `date`, `decisions`, `raw_consumption_kw`, `solar_forecast_kwh`).
     We capture it row-by-row so subsequent reconciliation can join on
     (target_date, hour).
+
+    ``day_types`` ({ISO date: profile bucket}) puts each row in the bucket
+    its forecast was read from — Sunday's on a public holiday — next to the
+    learned multiplier already inside that forecast.  A date missing from it
+    (mock data) keeps its calendar weekday and carries no multiplier.
 
     Failures here are swallowed — the user's run already succeeded; we
     don't want a DB hiccup to bubble up as a 500.
@@ -541,7 +562,8 @@ def _record_predictions_for_response(
                 day_obj = date.fromisoformat(target_date)
             except (TypeError, ValueError):
                 continue
-            weekday = day_obj.weekday()
+            bucket = day_types.get(target_date)
+            weekday = day_obj.weekday() if bucket is None else bucket
             cons_block = day.get("raw_consumption_kw") or []
             sol_block = day.get("solar_forecast_kwh") or []
             decisions = day.get("decisions") or []
@@ -569,6 +591,8 @@ def _record_predictions_for_response(
                         "predicted_net_load_kw": net,
                         "price_plkwh": d.get("price_plkwh"),
                         "adjustments_applied": adjustments_applied,
+                        "consumption_multiplier": 1.0 if bucket is None
+                        else overrides.consumption_adjustment_for(bucket, hour),
                     }
                 )
             if rows:
@@ -597,8 +621,8 @@ def optimize_endpoint():
         objective           — 'min_cost' or 'min_cost_per_kwh'.
 
     GBB-inspired overrides (all optional):
-        max_soc_pct         — MaxSOC buffer % (default 95, GBB recommends 90).
-        min_soc_pct         — MinSOC % (default 10, depth-of-discharge floor).
+        max_soc_pct         — MaxSOC buffer % (default MAX_SOC_PCT from .env, GBB recommends 90).
+        min_soc_pct         — MinSOC % (default MIN_SOC_PCT from .env, the reserve).
         full_charge_days    — CSV day-of-month (e.g. "1,15") forced to 100% SOC.
         per_date_target_soc — CSV/JSON of date→%, e.g. "2026-05-21:80".
         consumption_scale   — Multiplier on the learned profile (e.g. 0.5 "away").
@@ -671,7 +695,9 @@ def optimize_endpoint():
     prices, dummy_loads, initial_soc, aux, stderr_log = _get_data(
         mock, ha_url, ha_token, "available", days, overrides=overrides
     )
-    start_hour = 0 if mock else datetime.now(WARSAW_TZ).hour
+    now = datetime.now(WARSAW_TZ)
+    start_hour = 0 if mock else now.hour
+    first_hour_fraction = 1.0 if mock else _hour_left(now)
 
     # End-of-day SOC targets: the dashboard helpers (today / tomorrow), then
     # this request's target_soc for the day(s) it names (-1 clears), then an
@@ -699,6 +725,7 @@ def optimize_endpoint():
             horizon_dates=aux.get("horizon_dates"),
             overrides=overrides,
             pv_surplus=aux.get("pv_surplus_kw"),
+            first_hour_fraction=first_hour_fraction,
         )
     except Exception as e:
         return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
@@ -751,7 +778,9 @@ def optimize_endpoint():
         )
 
     # Record predictions for later reconciliation (best-effort, never fatal).
-    _record_predictions_for_response(responses, adj_meta.get("applied", False))
+    _record_predictions_for_response(
+        responses, adj_meta.get("applied", False), overrides, aux.get("day_types") or {}
+    )
 
     plan = (
         _plan(responses, initial_soc, pins, overrides.min_soc_pct)
@@ -821,15 +850,17 @@ def sensitivity_endpoint():
         mock, ha_url, ha_token, "available", days, overrides=overrides
     )
     b = 1 if horizon == "tomorrow" and not mock and len(prices) > 24 else 0
-    start_hour = 0 if mock or b else datetime.now(WARSAW_TZ).hour
+    now = datetime.now(WARSAW_TZ)
+    start_hour = 0 if mock or b else now.hour
     if b:
         try:
             per_day, _ = _run_horizon_optimization(
                 prices, dummy_loads, initial_soc,
                 {**(aux.get("day_targets") or {}), **overrides.per_date_target_soc},
-                start_hour=datetime.now(WARSAW_TZ).hour,
+                start_hour=now.hour,
                 horizon_dates=aux.get("horizon_dates"), overrides=overrides,
                 pv_surplus=aux.get("pv_surplus_kw"),
+                first_hour_fraction=_hour_left(now),
             )
         except Exception as e:
             return jsonify({"error": f"Optimization failed: {str(e)}"}), 500
@@ -859,6 +890,7 @@ def sensitivity_endpoint():
             prices[day], dummy_loads[day], initial_soc, start_hour=start_hour,
             max_soc=day_max_soc, min_soc=day_min_soc,
             pv_surplus=(aux.get("pv_surplus_kw") or [])[day] or None,
+            first_hour_fraction=1.0 if mock or b else _hour_left(now),
         )
     except Exception as e:
         return jsonify({"error": f"Sensitivity analysis failed: {str(e)}"}), 500

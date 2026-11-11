@@ -18,12 +18,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import api  # noqa: E402
 import rest_service as rs  # noqa: E402
+from battery_model import DISCHARGE_EFFICIENCY, NOMINAL_VOLTAGE  # noqa: E402
 
-TODAY = datetime.now(rs.WARSAW_TZ).date()
+NOW = datetime.now(rs.WARSAW_TZ).replace(minute=15, second=0, microsecond=0)
+TODAY = NOW.date()
+
+
+class _Clock(datetime):
+    """rest_service's clock, stopped at hh:15 so every request plans the same 45 minutes."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
+
+
 DAY = [1.1, 1.0, 0.9, 0.9, 1.0, 1.1, 1.5, 1.9, 1.8, 1.3, 1.0, 0.8,
        0.7, 0.7, 0.8, 1.2, 1.6, 2.0, 2.1, 2.0, 1.8, 1.5, 1.2, 1.1]
 LOAD = [0.3] * 6 + [0.6] * 3 + [0.8] * 8 + [0.6] * 7
 HELPERS: dict = {}  # dashboard input_number targets the fake HA returns
+DAY_TYPES: dict = {}  # {ISO date: profile bucket} the fake HA returns
 
 
 def fake_fetch_all_data(base_url, token, days, horizon, overrides):
@@ -36,11 +49,13 @@ def fake_fetch_all_data(base_url, token, days, horizon, overrides):
         "day_targets": dict(HELPERS),
         "out_of_work_days": [],
         "horizon_dates": [(TODAY + timedelta(days=i)).isoformat() for i in range(3)],
+        "day_types": dict(DAY_TYPES),
     }
 
 
 def main() -> None:
     rs.fetch_all_data = fake_fetch_all_data
+    rs.datetime = _Clock
     rs.history_db.record_predictions = lambda rows: None  # keep the real DB clean
     c = rs.app.test_client()
 
@@ -62,6 +77,10 @@ def main() -> None:
     assert sum(len([d for d in hours if w["start"] <= d["start"] < w["end"]]) for w in plan["ac_windows"]) \
         == plan["totals"]["ac_hours"] == len([d for d in hours if d["ac_on"]])
     assert plan["totals"]["estimated_prices_from"] == days[2]["decisions"][0]["start"]
+    # The running hour is planned for the 45 minutes it has left.
+    first = hours[0]
+    whole_hour_wh = first["charge_amps"] * NOMINAL_VOLTAGE if first["ac_on"] else LOAD[NOW.hour] / DISCHARGE_EFFICIENCY * 1000
+    assert abs((first["charge_wh"] or first["discharge_wh"]) - 0.75 * whole_hour_wh) < 0.01, first
 
     # 'today' / 'tomorrow' are days of the same joint plan: tomorrow starts
     # where today ends, not from the SOC right now.
@@ -92,6 +111,16 @@ def main() -> None:
     assert r["plan"]["target_soc"] == "auto"
     assert r["plan"]["totals"]["min_soc_pct"] >= 10 - 0.1
     assert all("effective_target_soc_pct" not in d for d in r["days"])
+    # A public holiday is planned from the Sunday profile: its forecast is
+    # stored in the Sunday bucket, with the multiplier it was made with.
+    rows: list = []
+    rs.history_db.record_predictions = rows.extend
+    rs.history_db.get_adjustments = lambda: {(6, 5): {"consumption_multiplier": 1.2}}
+    DAY_TYPES[days[1]["date"]] = 6
+    c.get("/optimize?ha_token=x")
+    holiday = [row for row in rows if row["target_date"] == days[1]["date"]]
+    assert len(holiday) == 24 and all(row["weekday"] == 6 for row in holiday), holiday
+    assert [row["consumption_multiplier"] for row in holiday] == [1.0] * 5 + [1.2] + [1.0] * 18
     # The .env token goes only to the .env HA, never to a host the request names.
     saved, rs.config.HA_TOKEN = rs.config.HA_TOKEN, "T"
     assert rs._ha_credentials({}) == (rs.config.HA_URL, "T")

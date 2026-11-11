@@ -26,8 +26,10 @@ installation. The exposed knobs are:
                               100%" feature.  Used for periodic balance cycles.
 * ``max_soc_pct``           — default MaxSOC in percent (GBB recommends 90%
                               as a buffer against forecast error; we keep 95%
-                              as default to match prior behaviour).
-* ``min_soc_pct``           — default MinSOC in percent (DoD floor).
+                              as default to match prior behaviour).  Default
+                              from ``MAX_SOC_PCT`` in ``.env``.
+* ``min_soc_pct``           — default MinSOC in percent (DoD floor, the
+                              reserve).  Default from ``MIN_SOC_PCT`` in ``.env``.
 * ``per_date_target_soc``   — ``{"YYYY-MM-DD": pct}`` — pin a specific day's
                               end-of-day target SOC.  Overrides the global
                               target_soc for that date.
@@ -51,6 +53,7 @@ from datetime import date
 from typing import Optional
 
 import config
+from battery_model import MAX_SOC_PCT, MIN_SOC_PCT
 
 
 @dataclass
@@ -64,8 +67,8 @@ class OptimizerOverrides:
     solar_scale: float = 1.0
     solar_override_kwh: Optional[list[float]] = None
     full_charge_days: set[int] = field(default_factory=set)
-    max_soc_pct: float = 95.0
-    min_soc_pct: float = 10.0
+    max_soc_pct: float = MAX_SOC_PCT
+    min_soc_pct: float = MIN_SOC_PCT
     per_date_target_soc: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
     # From PRICE_SHIELD in .env (config.py), not from the request.
@@ -335,8 +338,8 @@ def build_overrides_from_query(args: dict) -> OptimizerOverrides:
         solar_scale=_f("solar_scale", 1.0),
         solar_override_kwh=parse_csv_floats(args.get("solar_override_kwh")),
         full_charge_days=parse_csv_ints(args.get("full_charge_days")),
-        max_soc_pct=_f("max_soc_pct", 95.0),
-        min_soc_pct=_f("min_soc_pct", 10.0),
+        max_soc_pct=_f("max_soc_pct", MAX_SOC_PCT),
+        min_soc_pct=_f("min_soc_pct", MIN_SOC_PCT),
         per_date_target_soc=parse_per_date_target_soc(args.get("per_date_target_soc")),
         dry_run=_b("dry_run", False),
     )

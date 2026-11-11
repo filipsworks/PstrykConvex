@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_solar_kwh      REAL,
     predicted_net_load_kw    REAL,
     price_plkwh              REAL,
-    adjustments_applied      INTEGER NOT NULL DEFAULT 0
+    adjustments_applied      INTEGER NOT NULL DEFAULT 0,
+    consumption_multiplier   REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_predictions_target
@@ -119,6 +120,10 @@ def open_db(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
         try:
             conn.row_factory = sqlite3.Row
             conn.executescript(SCHEMA)
+            try:  # databases made before the learned multiplier was stored per prediction
+                conn.execute("ALTER TABLE predictions ADD COLUMN consumption_multiplier REAL")
+            except sqlite3.OperationalError:
+                pass  # column already there
             yield conn
             conn.commit()
         finally:
@@ -140,9 +145,12 @@ def record_predictions(
     """Append per-hour predictions for a single optimizer run.
 
     Each row must contain:
-        target_date (str, YYYY-MM-DD), hour (0..23), weekday (0..6),
+        target_date (str, YYYY-MM-DD), hour (0..23), weekday (0..6: the
+        profile bucket, so 6 on a public holiday),
         predicted_consumption_kw, predicted_solar_kwh,
         predicted_net_load_kw, price_plkwh, adjustments_applied (bool).
+    Optional: consumption_multiplier — the learned multiplier already
+    inside predicted_consumption_kw.
 
     Returns the number of rows inserted.
     """
@@ -156,8 +164,9 @@ def record_predictions(
             INSERT INTO predictions
                 (recorded_at, target_date, hour, weekday,
                  predicted_consumption_kw, predicted_solar_kwh,
-                 predicted_net_load_kw, price_plkwh, adjustments_applied)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 predicted_net_load_kw, price_plkwh, adjustments_applied,
+                 consumption_multiplier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -170,6 +179,7 @@ def record_predictions(
                     _opt_float(r.get("predicted_net_load_kw")),
                     _opt_float(r.get("price_plkwh")),
                     1 if r.get("adjustments_applied") else 0,
+                    _opt_float(r.get("consumption_multiplier")),
                 )
                 for r in rows
             ],

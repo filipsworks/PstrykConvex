@@ -1,46 +1,57 @@
-"""Battery model: constants, SOC estimation from voltage."""
+"""Battery model: constants, SOC estimation from voltage.
+
+The numbers come from ``.env`` / ``.env.defaults`` (see config.py); the values
+in the comments below are the committed defaults.
+"""
+
+import os
+
+import config  # noqa: F401 — loads .env before the values are read
 
 # Pack specs (16s LiFePo4 — 2026-09 upgrade from 8s/24 V, cell count doubled
 # in series so pack voltage doubled while Ah stayed the same → 2× energy)
-NOMINAL_VOLTAGE = 52.0  # V — nominal pack voltage
-MAX_CHARGE_CURRENT_A = 80  # A — grid (AC) charge ceiling, the inverter's "Max ładowanie AC"
-MAX_TOTAL_CHARGE_CURRENT_A = 150  # A — PV + grid together, the inverter's "Max ładowanie Σ"
-CAPACITY_AH = 320  # Ah — cell capacity
+NOMINAL_VOLTAGE = float(os.environ["NOMINAL_VOLTAGE"])  # V — nominal pack voltage (52.0)
+MAX_CHARGE_CURRENT_A = int(os.environ["MAX_CHARGE_CURRENT_A"])  # A — grid (AC) charge ceiling, the inverter's "Max ładowanie AC" (80)
+MAX_TOTAL_CHARGE_CURRENT_A = float(os.environ["MAX_TOTAL_CHARGE_CURRENT_A"])  # A — PV + grid together, the inverter's "Max ładowanie Σ" (150)
+CAPACITY_AH = float(os.environ["CAPACITY_AH"])  # Ah — cell capacity (320)
 
-# SOC bounds (DoD limits to prolong life)
-MIN_SOC = 0.10  # 10% depth of discharge
-MAX_SOC = 0.95  # 95% top of charge
+# SOC bounds (DoD limits to prolong life), in percent: the defaults of the
+# min_soc_pct / max_soc_pct request parameters.
+MIN_SOC_PCT = float(os.environ["MIN_SOC_PCT"])  # 10 — the reserve
+MAX_SOC_PCT = float(os.environ["MAX_SOC_PCT"])  # 95
+MIN_SOC = MIN_SOC_PCT / 100  # 10% depth of discharge
+MAX_SOC = MAX_SOC_PCT / 100  # 95% top of charge
 
 # Voltage range for linear SOC mapping (16s LiFePo4 pack)
 # 48.0 V = 0% SOC (cutoff), 56.0 V = 100% SOC (full charge) — 3.0/3.5 V per cell,
 # matching the inverter's own maximum_charging_voltage (56.0 V) and OP1 off-grid
 # low-voltage protection (48.0 V).
 # Voltages above 56.0 V can occur during active charging — voltage_to_soc clamps to 100%.
-VOLTAGE_MIN = 48.0  # V → 0% SOC
-VOLTAGE_MAX = 56.0  # V → 100% SOC
+VOLTAGE_MIN = float(os.environ["VOLTAGE_MIN"])  # V → 0% SOC (48.0)
+VOLTAGE_MAX = float(os.environ["VOLTAGE_MAX"])  # V → 100% SOC (56.0)
 
 # Round-trip efficiency breakdown
-CHARGE_EFFICIENCY = 0.95  # BMS + wiring losses during charge
-DISCHARGE_EFFICIENCY = 0.95  # inverter losses during discharge
+CHARGE_EFFICIENCY = float(os.environ["CHARGE_EFFICIENCY"])  # BMS + wiring losses during charge (0.95)
+DISCHARGE_EFFICIENCY = float(os.environ["DISCHARGE_EFFICIENCY"])  # inverter losses during discharge (0.95)
 ROUND_TRIP_EFFICIENCY = CHARGE_EFFICIENCY * DISCHARGE_EFFICIENCY
 
 # Discrete charging steps: 10A-80A in 10A increments (minimum practical charge).
 # Written to number.…_maximum_mains_charging_current (accepts 5–120 A).
-CHARGE_STEPS_A = [0, 10, 20, 30, 40, 50, 60, 70, 80]
+CHARGE_STEPS_A = list(range(0, MAX_CHARGE_CURRENT_A + 1, 10))
 
 # Ceiling on grid→battery power used by the optimizer. Non-binding at the
 # current 80 A / 52 V (4.16 kW) — lower it to throttle grid charging.
-MAX_CHARGE_POWER_KW = 5.0
+MAX_CHARGE_POWER_KW = float(os.environ["MAX_CHARGE_POWER_KW"])  # 5.0
 
 # Grid connection: one phase, 25 A breaker. The BleBox on the main feed sees
 # everything behind the Pstryk meter — inverter AC input and the dummy load.
-GRID_LIMIT_KW = 25 * 230 / 1000  # 5.75 kW
+GRID_LIMIT_KW = float(os.environ["GRID_LIMIT_KW"])  # 25 A × 230 V = 5.75 kW
 
 # Negative-price dummy load: its own circuit straight from the grid, outside
 # the inverter, switched on whenever the price is < 0. The optimizer only
 # reserves its share of the breaker; its earnings are not modelled (Pstryk AIO
 # shows them). Set to 0 if the dummy circuit is off.
-DUMMY_LOAD_KW = 4.5
+DUMMY_LOAD_KW = float(os.environ["DUMMY_LOAD_KW"])  # 4.5
 
 # Derived
 TOTAL_CAPACITY_WH = NOMINAL_VOLTAGE * CAPACITY_AH  # ~16640 Wh (V × Ah = Wh)

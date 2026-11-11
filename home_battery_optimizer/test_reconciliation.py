@@ -230,6 +230,28 @@ def main() -> None:
         f"cons_mape={first['consumption_mape']}%, bias={first['consumption_bias']}"
     )
 
+    # ── 10. Multiplier reaches the real ratio ─────────────────────────
+    _section("Multiplier settles at the real ratio")
+    history_db.reset_adjustments()
+    mult = 1.0
+    for week in range(30):  # the same (Monday, 12:00) bucket, week after week
+        day = (date(2030, 1, 7) + timedelta(weeks=week)).isoformat()
+        history_db.record_predictions([{
+            "target_date": day, "hour": 12, "weekday": 0,
+            "predicted_consumption_kw": mult, "predicted_solar_kwh": 0.0,
+            "predicted_net_load_kw": mult, "price_plkwh": 1.0,
+            "adjustments_applied": True, "consumption_multiplier": mult,
+        }])
+        history_db.upsert_actuals([{
+            "target_date": day, "hour": 12, "weekday": 0, "actual_consumption_kw": 1.3,
+            "actual_solar_kwh": 0.0, "actual_net_load_kw": 1.3,
+        }])
+        reconciliation.reconcile_date(day)
+        mult = history_db.get_adjustments()[(0, 12)]["consumption_multiplier"]
+    if abs(mult - 1.3) > 0.01:
+        _fail(f"real use is 1.30 x the profile, multiplier settled at {mult}")
+    _ok(f"profile x {mult} after 30 weeks of 1.30 x actuals")
+
     print("\nAll checks passed.")
 
 

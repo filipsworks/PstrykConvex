@@ -8,6 +8,7 @@ import click
 
 import config
 from api import fetch_all_data
+from battery_model import MAX_SOC_PCT, MIN_SOC_PCT
 from optimizer import OBJECTIVE_MIN_COST, OBJECTIVE_MIN_COST_PER_KWH, VALID_OBJECTIVES, optimize
 from overrides import OptimizerOverrides, build_overrides_from_query
 
@@ -141,9 +142,9 @@ MOCK_DUMMY_LOADS = [
         "'min_cost_per_kwh' minimises average PLN/kWh by sweeping EOD SOC targets."
     ),
 )
-@click.option("--max-soc-pct", type=float, default=95.0, show_default=True,
+@click.option("--max-soc-pct", type=float, default=MAX_SOC_PCT, show_default=True,
               help="Upper SOC bound in percent (GBB-style buffer; lower = more headroom).")
-@click.option("--min-soc-pct", type=float, default=10.0, show_default=True,
+@click.option("--min-soc-pct", type=float, default=MIN_SOC_PCT, show_default=True,
               help="Lower SOC bound in percent (depth-of-discharge floor).")
 @click.option("--full-charge-days", default="", metavar="CSV",
               help="Day-of-month CSV (e.g. '1,15') forced to MaxSOC=100% for a balance cycle.")

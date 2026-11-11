@@ -2,14 +2,16 @@
 
 The unit of learning is the ``(weekday, hour)`` bucket — same shape as the
 consumption profile the optimizer feeds on.  For each hour with both a
-prediction and an actual we compute ``ratio = actual / predicted``, then
-exponentially smooth that into the stored multiplier:
+prediction and an actual we compute ``ratio = actual / predicted``.  The
+prediction was made with a multiplier already inside, so ``ratio`` times
+that multiplier is what it should have been; that is exponentially smoothed
+into the stored multiplier:
 
-    new_mult = alpha * ratio + (1 - alpha) * old_mult
+    new_mult = alpha * (ratio * mult_in_prediction) + (1 - alpha) * old_mult
 
-Ratios are clamped to a sane range (default 0.5 – 2.0) so a one-off spike
-doesn't poison the multiplier; near-zero predictions are skipped to avoid
-explosive divisions.
+Ratios and the result are clamped to a sane range (default 0.5 – 2.0) so a
+one-off spike doesn't poison the multiplier; near-zero predictions are
+skipped to avoid explosive divisions.
 
 The same mechanism tracks solar (MAPE, bias and a ``solar_multiplier``),
 but only for reporting: the planner aims at the PV forecast and corrects
@@ -150,7 +152,12 @@ def reconcile_date(
             per_hour_entry["consumption_ratio"] = round(ratio, 4)
             cons_ratios.append(ratio)
             cons_abs_pct_errs.append(abs(ac - pc) / pc * 100.0)
-            new_cons_mult = round(alpha * ratio + (1.0 - alpha) * new_cons_mult, 4)
+            # Smoothing the bare ratio only gets to the square root of the error.
+            applied = p.get("consumption_multiplier")
+            if applied is None:  # row from before that column existed
+                applied = new_cons_mult if p.get("adjustments_applied") else 1.0
+            target = max(min_ratio, min(max_ratio, ratio * applied))
+            new_cons_mult = round(alpha * target + (1.0 - alpha) * new_cons_mult, 4)
 
         # Solar update — only if the prediction wasn't trivially zero (night).
         ps = p["predicted_solar_kwh"]

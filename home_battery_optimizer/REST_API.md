@@ -43,6 +43,9 @@ service after a change.
 | `BATTERY_VOLTAGE_ENTITY`, `INVERTER_OUTPUT_POWER_ENTITY`, `PV_ENERGY_TOTAL_ENTITY`, `PV_ENERGY_TODAY_ENTITY` | Inverter (DessMonitor) sensors |
 | `BMS_SOC_ENTITY` | JK BMS SOC |
 | `SOLAR_FORECAST_TODAY_ENTITY`, `SOLAR_FORECAST_TOMORROW_ENTITY`, `SOLAR_FORECAST_D2_ENTITY` | PV forecast sensors |
+| `MIN_SOC_PCT`, `MAX_SOC_PCT` | Reserve the plan never goes below and the top of charge (% SOC); defaults for `min_soc_pct` / `max_soc_pct` |
+| `NOMINAL_VOLTAGE`, `CAPACITY_AH`, `VOLTAGE_MIN`, `VOLTAGE_MAX`, `CHARGE_EFFICIENCY`, `DISCHARGE_EFFICIENCY` | Battery model (see `battery_model.py`) |
+| `MAX_CHARGE_CURRENT_A`, `MAX_TOTAL_CHARGE_CURRENT_A`, `MAX_CHARGE_POWER_KW`, `GRID_LIMIT_KW`, `DUMMY_LOAD_KW` | Inverter charge ceilings, breaker limit and the negative-price dummy load |
 | `SOC_TARGET_TODAY_ENTITY`, `SOC_TARGET_TOMORROW_ENTITY` | Dashboard end-of-day SOC target helpers |
 | `BATTERY_HISTORY_DB` | SQLite prediction store; empty = `home_battery_optimizer/data/history.db` |
 
@@ -147,8 +150,8 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_soc_pct` | float | `95` | Upper SOC bound % (GBB recommends `90` as a buffer against forecast error). |
-| `min_soc_pct` | float | `10` | Lower SOC bound % — depth-of-discharge floor. |
+| `max_soc_pct` | float | `MAX_SOC_PCT` (`.env`, `95`) | Upper SOC bound % (GBB recommends `90` as a buffer against forecast error). |
+| `min_soc_pct` | float | `MIN_SOC_PCT` (`.env`, `10`) | Lower SOC bound % — depth-of-discharge floor, the reserve. |
 | `full_charge_days` | csv | *(empty)* | Day-of-month CSV (e.g. `1,15`). On those days `max_soc` is forced to **100%** for a balance/full-charge cycle. |
 | `per_date_target_soc` | csv/JSON | *(empty)* | Per-date EOD SOC pins, e.g. `2026-05-21:80,2026-05-22:30` or `{"2026-05-21":80}`. Overrides global `target_soc` for that date. |
 | `consumption_scale` | float | `1.0` | Multiplier on the auto-learned profile (`0.5` "we're away", `1.4` "lots of guests"). |
@@ -204,7 +207,12 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > stays offgrid. Grid import (house + charging) stays within the 25 A
 > breaker; in negative-price hours the dummy circuit (4.5 kW, outside the
 > inverter) takes its share first (`GRID_LIMIT_KW` / `DUMMY_LOAD_KW` in
-> `battery_model.py`).
+> `.env`).
+>
+> **Running hour:** a plan made at hh:15 has 45 minutes of that hour left, so
+> the first decision's energy and cost (`charge_wh`, `discharge_wh`,
+> `pv_charge_wh`, `grid_kwh`, costs) cover those 45 minutes only; powers
+> (`charge_amps`, `total_active_kw`) are not scaled.
 
 **Response:**
 
@@ -513,12 +521,17 @@ completed days from Home Assistant history, write them into the `actuals`
 table, then update the learned `(weekday, hour)` multipliers using:
 
 ```
-new_mult = alpha * (actual / predicted) + (1 - alpha) * old_mult
+new_mult = alpha * (actual / predicted) * mult_in_prediction + (1 - alpha) * old_mult
 ```
 
-with `actual / predicted` clamped to `[0.5, 2.0]` to suppress one-off
-spikes, and near-zero predictions (≤ 0.05 kW / kWh) skipped to avoid
-divide-by-zero blow-ups.
+The consumption forecast already carries the learned multiplier it was made
+with (stored per prediction), so `actual / predicted` times that multiplier
+is the value the multiplier should have had; it settles at the real ratio of
+use to profile.  Solar has no multiplier in its forecast and smooths the bare
+ratio.  `actual / predicted` and the consumption target are clamped to
+`[0.5, 2.0]` to suppress one-off spikes, and near-zero predictions
+(≤ 0.05 kW / kWh) are skipped to avoid divide-by-zero blow-ups.  A public
+holiday is forecast from the Sunday profile and updates the Sunday bucket.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

@@ -826,6 +826,7 @@ def fetch_all_data(
           - out_of_work_days: list of out-of-work dates (Sat/Sun + PL holidays)
                               covering the horizon.
           - horizon_dates: dates assigned to each 24-hour block.
+          - day_types: ``{ISO date: profile bucket}`` (weekday, 6 on a holiday).
     """
     if overrides is None:
         overrides = OptimizerOverrides()
@@ -871,4 +872,5 @@ def fetch_all_data(
         "consumption_profiles": consumption["profiles"],
         "out_of_work_days": out_of_work_days,
         "horizon_dates": [d.isoformat() for d in h_dates],
+        "day_types": {d.isoformat(): day_type(d, holidays) for d in h_dates},
     }
