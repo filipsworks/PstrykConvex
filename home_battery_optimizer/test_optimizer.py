@@ -44,15 +44,18 @@ def _prices(values):
     return [{"hour": h, "price": p} for h, p in enumerate(values)]
 
 
-def _replay(result, deficit, surplus, soc0, cheapest_first=True):
-    """Recompute SOC from the chosen modes only and compare with the plan."""
+def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
+    """Recompute SOC from the chosen modes only and compare with the plan.
+
+    ``floors`` is {hour index: SOC fraction} for SOC targets inside the plan.
+    """
     soc = soc0 * CAP_KWH
     hi = max(MAX_SOC, soc0) * CAP_KWH
-    charged = []  # (decision, hour, voluntary)
+    rows = []  # (hour, price, amps, SOC before, SOC after in kWh, charges by choice)
     for i, d in enumerate(result["decisions"]):
         h = len(deficit) - len(result["decisions"]) + i
-        if d["ac_on"]:
-            charged.append((d, h, soc - deficit[h] / DISCHARGE_EFFICIENCY - 0.10 * CAP_KWH > 1e-3))
+        before = soc
+        by_choice = d["ac_on"] and soc - deficit[h] / DISCHARGE_EFFICIENCY - 0.10 * CAP_KWH > 1e-3
         # Only two modes: offgrid, or AC on and charging — never a plain bypass.
         assert (d["output_mode"], d["charger_mode"]) in (("SBU", "OSO"), ("SUB", "SNU")), d
         assert d["ac_on"] == (d["output_mode"] == "SUB") and (not d["ac_on"] or d["charge_amps"] >= 10), d
@@ -67,16 +70,31 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True):
         cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if d["price_plkwh"] < 0 else 0.0)
         grid_kw = (0 if d["output_mode"] == "SBU" else deficit[h]) + grid_in / CHARGE_EFFICIENCY
         assert grid_kw <= cap + 1e-6, (h, grid_kw, cap)
-    # A cheaper charging hour runs at its cap (80 A or what the breaker
-    # leaves) whenever a dearer hour charges by choice — i.e. offgrid there
-    # would have kept the 10 % reserve.
-    charging = [(d["price_plkwh"], h, d["charge_amps"], vol) for d, h, vol in charged]
-    for p_dear, h_dear, _, vol in charging:
-        for p, h, amps, _ in charging:
-            if cheapest_first and vol and p < p_dear:
-                cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if p < 0 else 0.0) - deficit[h]
-                full = min(MAX_CHARGE_CURRENT_A, int(cap / (NOMINAL_VOLTAGE / 1000 * 10 / CHARGE_EFFICIENCY) + 1e-9) * 10)
-                assert amps >= full, (h, p, amps, full, "dearer voluntary", h_dear, p_dear)
+        rows.append((h, d["price_plkwh"], d["charge_amps"], before, soc, by_choice))
+    # Every cheaper hour — charging or not — runs at its cap (80 A or what the
+    # breaker leaves) whenever a dearer hour charges by choice, i.e. offgrid
+    # there would have kept the 10 % reserve.  Exempt: a cheaper hour with no
+    # room for a whole 10 A step before or after it; a later cheaper hour when
+    # the battery comes within one step of its floor first; an earlier one
+    # when it comes within one step of its ceiling in between.
+    step = NOMINAL_VOLTAGE / 1000 * 10
+    tol = 1e-3
+    near_top = hi - step - tol
+    for h_dear, p_dear, _, _, _, by_choice in rows:
+        for h, p, amps, before, after, _ in rows:
+            if not (cheapest_first and by_choice and p < p_dear):
+                continue
+            between = [r for r in rows if min(h, h_dear) <= r[0] < max(h, h_dear)]
+            if h > h_dear:
+                exempt = any(
+                    r[4] <= max(0.10, (floors or {}).get(r[0], 0.0)) * CAP_KWH + step + tol for r in between
+                )
+            else:
+                exempt = any(r[4] >= near_top for r in between)
+            exempt = exempt or before >= near_top or after >= near_top
+            cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if p < 0 else 0.0) - deficit[h]
+            full = min(MAX_CHARGE_CURRENT_A, int(cap / (step / CHARGE_EFFICIENCY) + 1e-9) * 10)
+            assert exempt or amps >= full, (h, p, amps, full, "dearer voluntary", h_dear, p_dear)
 
 
 def check_no_pv():
@@ -117,12 +135,11 @@ def check_negative_prices_beyond_capacity():
 def check_breaker_caps_charging():
     load = [2.0] * 24
     r = optimize(_prices(PRICES), load, 0.15, target_soc=0.9)
-    # 12 h at the breaker's 60 A fall just short of 90 %: the target wins over
-    # the cheapest-hour-first rule (bent, or dropped when the MILP runs out of
-    # time) — flagged, and the breaker is never passed.
+    # 12 h at the breaker's 60 A fall just short of 90 %: the target is
+    # reached and the breaker is never passed.  The cheapest-hour-first rule
+    # holds unless it is bent or the MILP runs out of time (both flagged).
     assert r["summary"]["target_reached"], r["summary"]
-    assert any("rule bent" in w or "ran out of time" in w for w in r["warnings"]), r["warnings"]
-    _replay(r, load, [0.0] * 24, 0.15, cheapest_first=False)
+    _replay(r, load, [0.0] * 24, 0.15, cheapest_first=not r["warnings"])
     # 5.75 kW breaker − 2 kW house leaves room for 60 A, not 80 A.
     assert max(d["charge_amps"] for d in r["decisions"]) == 60
 
@@ -178,6 +195,36 @@ def check_cheapest_hour_full_first():
     assert r["decisions"][-1]["charge_amps"] == 80 and r["summary"]["target_reached"], r["decisions"]
 
 
+def check_cheaper_hour_left_off():
+    # 2026-11-12, price shield: a flat 0.871 night, 13:00 at 0.855, 23:00 at
+    # 0.838.  A 69 % target was met with 10 A in six 0.871 hours while 13:00
+    # stayed offgrid — a cheaper hour that does not charge at all dodged the
+    # rule.  Plan made at 23:00 for the rest of today, tomorrow and 11
+    # estimated hours.
+    day = [0.87084] * 6 + [1.292853] * 4 + [1.2880253, 1.2589481, 1.2361931, 0.8549546, 0.87084] \
+        + [1.292853] * 7 + [0.87084, 0.8383127]
+    load = [0.211, 0.17, 0.13, 0.138, 0.162, 0.122, 0.14, 0.104, 0.072, 0.128, 0, 0, 0, 0.016, 0.172,
+            0.449, 0.399, 0.398, 0.404, 0.682, 1.016, 0.466, 0.46, 0.352]
+    pv = [0.0] * 10 + [0.274, 0.366, 0.595] + [0.0] * 11
+    prices = _prices([0.87084] * 24 + day + day[:11])
+    deficit = [0.189] * 24 + load + load[:11]
+    surplus = [0.0] * 24 + pv + pv[:11]
+
+    r = optimize(prices, deficit, 0.46, start_hour=23, pv_surplus_kw=surplus, day_targets={1: 0.69})
+    _replay(r, deficit, surplus, 0.46, floors={47: 0.69})
+    tomorrow = r["blocks"][1]
+    amps = [d["charge_amps"] for d in tomorrow["decisions"]]
+    assert amps[13] == 80 and amps[23] == 80 and tomorrow["summary"]["target_reached"], amps
+    assert tomorrow["summary"]["ac_hours"] <= 3, amps
+
+    # The rule must not push buying from the cheap night into the dear
+    # morning: a low battery charges at 0.871 before 13:00 comes.
+    r = optimize(prices, deficit, 0.17, start_hour=23, pv_surplus_kw=surplus)
+    _replay(r, deficit, surplus, 0.17)
+    dear_kwh = sum(d["grid_kwh"] for d in r["decisions"] if d["price_plkwh"] > 1.0)
+    assert dear_kwh == 0 and not r["warnings"], (dear_kwh, r["warnings"])
+
+
 def check_first_hour_fraction():
     # A plan made at 22:30 has half of that hour left: 80 A moves 12.5 % of
     # SOC there, not 25 %, and costs half; the next hour is a whole one.
@@ -207,6 +254,7 @@ if __name__ == "__main__":
     check_joint_horizon_sees_tomorrow()
     check_day_targets()
     check_cheapest_hour_full_first()
+    check_cheaper_hour_left_off()
     check_first_hour_fraction()
     check_min_cost_per_kwh_still_works()
     print("optimizer self-check OK")

@@ -34,8 +34,8 @@ _EPS = 1e-4
 # only misses a limit when no plan can keep it.
 _PENALTY = 1000.0
 
-# PLN per 10 A step a cheaper charging hour stays below its cap while a
-# dearer one charges — above any price gap a step can make, below a missed
+# PLN per 10 A step a cheaper hour stays below its cap while a dearer one
+# charges by choice — above any price gap a step can make, below a missed
 # SOC target or reserve, so the rule only gives way to those.
 _RULE_PENALTY = 10.0
 
@@ -186,10 +186,11 @@ def _build_and_solve(
         # still trip the breaker; lower GRID_LIMIT_KW if that happens.
         grid_load + grid_charge <= grid_cap + over,
     ]
-    # Fill the cheaper charging hour to its full current before a dearer one:
-    # when both charge, the cheaper runs at its cap (80 A, less where the
-    # breaker leaves less), so the rest of a 10 A step lands on the dearest
-    # charging hour instead of small charges spread over pricier hours.
+    # Fill the cheaper hour to its full current before a dearer one: a dearer
+    # hour charges by choice only when every cheaper hour runs at its cap
+    # (80 A, less where the breaker leaves less) — a cheaper hour left offgrid
+    # counts too.  So the rest of a 10 A step lands on the dearest charging
+    # hour instead of small charges spread over pricier hours.
     # A grid hour forced by the reserve (offgrid would drop the SOC below it)
     # is exempt: it must take 10 A anyway and says nothing about prices.
     step_grid_kw = step_kw / eta_ch
@@ -198,13 +199,39 @@ def _build_and_solve(
     # Charging never plans past what the breaker leaves; only the house load
     # itself may (the 'over' slack), and a forced grid hour still gets 10 A.
     constraints.append(k <= np.maximum(k_cap, 1))
-    cheap, dear = np.nonzero(price[:, None] < price[None, :])
     missed = cp.Variable(n, nonneg=True)  # steps a cheaper hour stays below its cap
-    if cheapest_first and len(cheap):
+    span = float(np.ptp(price))
+    if cheapest_first and span > 0:
+        # The rule as a price threshold per hour: an hour charges by choice
+        # only at or below it, and every hour below it runs at its cap.  A
+        # cheaper hour cannot stand in for a dearer one across a battery
+        # limit, so the threshold may drop only after the SOC gets within one
+        # step of its floor (reserve or SOC target: energy bought before is
+        # needed there) and rise only after it gets within one step of its
+        # ceiling.  Without the first the rule would push buying from a cheap
+        # night into the dear morning.
+        step_soc = step_kw / capacity_kwh
+        soc_floor = np.full(n, soc_lo)
+        for t, tgt in targets.items():
+            soc_floor[t - 1] = max(soc_floor[t - 1], tgt)
         voluntary = cp.Variable(n, boolean=True)  # offgrid would keep the reserve
+        limit = cp.Variable(n)                    # price threshold
+        below = cp.Variable(n, boolean=True)      # the hour is cheaper than the threshold
+        low = cp.Variable(n, boolean=True)        # SOC after the hour is near its floor
+        high = cp.Variable(n, boolean=True)       # SOC after the hour is near its ceiling
+        # No room for a whole step before the hour or after it: nothing to fill.
+        full = high + cp.hstack([float(initial_soc >= soc_hi[0] - step_soc), high[:-1]])
         constraints += [
             voluntary >= soc[:-1] - dt * deficit / eta_dis / capacity_kwh - soc_lo,
-            k[cheap] + missed[cheap] >= cp.multiply(k_cap[cheap], voluntary[dear] - sbu[cheap] - sbu[dear]),
+            soc[1:] <= soc_floor + step_soc + (1 - low),
+            soc[1:] >= soc_hi - step_soc - (1 - high),
+            limit >= price.min(),
+            limit <= price.max(),
+            limit >= price - span * (1 - voluntary + sbu),
+            limit <= price + span * below,
+            limit[1:] >= limit[:-1] - span * low[:-1],
+            limit[1:] <= limit[:-1] + span * high[:-1],
+            k + missed >= cp.multiply(k_cap, below - full),
         ]
 
     for i, (t, tgt) in enumerate(targets.items()):
