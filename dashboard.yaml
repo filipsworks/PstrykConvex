@@ -234,7 +234,9 @@ views:
                       action: call-service
                       service: homeassistant.update_entity
                       target:
-                        entity_id: sensor.optimizer_decisions_today
+                        entity_id:
+                          - sensor.optimizer_decisions_today
+                          - sensor.optimizer_decisions_tomorrow
                     name: SOC Docelowy - Dziś
               - show_name: false
                 show_icon: true
@@ -259,7 +261,9 @@ views:
                       action: call-service
                       service: homeassistant.update_entity
                       target:
-                        entity_id: sensor.optimizer_decisions_tomorrow
+                        entity_id:
+                          - sensor.optimizer_decisions_today
+                          - sensor.optimizer_decisions_tomorrow
           - type: horizontal-stack
             cards:
               - type: custom:flex-table-card

@@ -72,17 +72,21 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
         assert grid_kw <= cap + 1e-6, (h, grid_kw, cap)
         rows.append((h, d["price_plkwh"], d["charge_amps"], before, soc, by_choice))
     # Every cheaper hour — charging or not — runs at its cap (80 A or what the
-    # breaker leaves) whenever a dearer hour charges by choice, i.e. offgrid
-    # there would have kept the 10 % reserve.  Exempt: a cheaper hour with no
-    # room for a whole 10 A step before or after it; a later cheaper hour when
-    # the battery comes within one step of its floor first; an earlier one
-    # when it comes within one step of its ceiling in between.
+    # breaker leaves) when a dearer hour charges: an earlier cheaper hour
+    # whatever the reason (also a reserve-forced charge: the earlier hour
+    # could have bought that energy), a later one when the dearer hour
+    # charges by choice, i.e. offgrid there would have kept the 10 % reserve.
+    # Exempt: a cheaper hour with no room for a whole 10 A step before or
+    # after it; a later cheaper hour when the battery comes within one step
+    # of its floor first; an earlier one when it comes within one step of its
+    # ceiling in between.
     step = NOMINAL_VOLTAGE / 1000 * 10
     tol = 1e-3
     near_top = hi - step - tol
-    for h_dear, p_dear, _, _, _, by_choice in rows:
+    for h_dear, p_dear, amps_dear, _, _, by_choice in rows:
         for h, p, amps, before, after, _ in rows:
-            if not (cheapest_first and by_choice and p < p_dear):
+            binds = amps_dear > 0 if h < h_dear else by_choice
+            if not (cheapest_first and binds and p < p_dear):
                 continue
             between = [r for r in rows if min(h, h_dear) <= r[0] < max(h, h_dear)]
             if h > h_dear:
@@ -94,7 +98,7 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
             exempt = exempt or before >= near_top or after >= near_top
             cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if p < 0 else 0.0) - deficit[h]
             full = min(MAX_CHARGE_CURRENT_A, int(cap / (step / CHARGE_EFFICIENCY) + 1e-9) * 10)
-            assert exempt or amps >= full, (h, p, amps, full, "dearer voluntary", h_dear, p_dear)
+            assert exempt or amps >= full, (h, p, amps, full, "dearer hour charges", h_dear, p_dear)
 
 
 def check_no_pv():
@@ -225,6 +229,26 @@ def check_cheaper_hour_left_off():
     assert dear_kwh == 0 and not r["warnings"], (dear_kwh, r["warnings"])
 
 
+def check_forced_hour_is_no_excuse():
+    # 2026-11-13 09:00, battery at 24 %, same prices; tomorrow estimated.
+    # The plan ran the battery down to the reserve by 22:00 (0.871) and bought
+    # there — 10 A for a 31 % target, 80 A with 45 % wanted tomorrow — while
+    # 13:00 (0.855) had room: a reserve-forced hour was exempt from the rule.
+    day = [0.87084] * 6 + [1.292853] * 4 + [1.2880253, 1.2589481, 1.2361931, 0.8549546, 0.87084] \
+        + [1.292853] * 7 + [0.87084, 0.8383127]
+    deficit = [0.0] * 9 + [0.031, 0, 0, 0, 0, 0.315, 0.448, 0.399, 0.398, 0.404, 0.682, 1.016, 0.466, 0.46, 0.35] \
+        + [0.348, 0.304, 0.292, 0.272, 0.245, 0.281, 0.581, 0.351, 0, 0, 0, 0, 0, 0, 0,
+           0.501, 0.463, 0.356, 0.397, 0.477, 0.45, 0.458, 0.324, 0.286]
+    surplus = [0.0] * 10 + [0.468, 0.017, 0.492, 0.127] + [0.0] * 10 \
+        + [0.0] * 8 + [0.121, 0.486, 1.075, 0.379, 1.191, 0.659, 0.09] + [0.0] * 9
+    for targets in ({0: 0.31}, {0: 0.30, 1: 0.45}):
+        r = optimize(_prices(day + day), deficit, 0.24, start_hour=9, pv_surplus_kw=surplus, day_targets=targets)
+        _replay(r, deficit, surplus, 0.24, floors={24 * b + 23: t for b, t in targets.items()})
+        today = {d["hour"]: d for d in r["blocks"][0]["decisions"]}
+        assert not today[22]["ac_on"] and today[13]["ac_on"] and not r["warnings"], (targets, r["warnings"])
+        assert all(b["summary"]["target_reached"] is not False for b in r["blocks"]), targets
+
+
 def check_first_hour_fraction():
     # A plan made at 22:30 has half of that hour left: 80 A moves 12.5 % of
     # SOC there, not 25 %, and costs half; the next hour is a whole one.
@@ -255,6 +279,7 @@ if __name__ == "__main__":
     check_day_targets()
     check_cheapest_hour_full_first()
     check_cheaper_hour_left_off()
+    check_forced_hour_is_no_excuse()
     check_first_hour_fraction()
     check_min_cost_per_kwh_still_works()
     print("optimizer self-check OK")

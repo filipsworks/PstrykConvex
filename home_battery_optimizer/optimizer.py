@@ -165,15 +165,18 @@ def _build_and_solve(
     # negative-price hours leave next to the dummy circuit, and late in the
     # day a target may be out of reach.
     over = cp.Variable(n, nonneg=True)   # kW of grid import over the breaker cap
-    under = cp.Variable(n, nonneg=True)  # SOC below the reserve
-    # SOC missing to each target (cvxpy has no 0-size variables; a spare one stays 0).
+    # Both in kWh, like the penalty: SOC-fraction slacks put 16 640 PLN next
+    # to 1e-4 tie-breakers in one objective and HiGHS then called a plan
+    # optimal that was 21 PLN off (2026-11-13).
+    under = cp.Variable(n, nonneg=True)  # kWh below the reserve
+    # kWh missing to each target (cvxpy has no 0-size variables; a spare one stays 0).
     short = cp.Variable(max(1, len(targets)), nonneg=True)
 
     constraints = [
         soc[0] == initial_soc,
         soc[1:] == soc[:-1]
         + cp.multiply(dt, k * step_kw + eta_ch * pv_in - discharge) / capacity_kwh,
-        soc[1:] + under >= soc_lo,
+        soc[1:] + under / capacity_kwh >= soc_lo,
         soc[1:] <= soc_hi,
         # AC on only to charge: a grid hour always takes at least one step.
         k >= 1 - sbu,
@@ -202,40 +205,48 @@ def _build_and_solve(
     missed = cp.Variable(n, nonneg=True)  # steps a cheaper hour stays below its cap
     span = float(np.ptp(price))
     if cheapest_first and span > 0:
-        # The rule as a price threshold per hour: an hour charges by choice
-        # only at or below it, and every hour below it runs at its cap.  A
-        # cheaper hour cannot stand in for a dearer one across a battery
-        # limit, so the threshold may drop only after the SOC gets within one
-        # step of its floor (reserve or SOC target: energy bought before is
-        # needed there) and rise only after it gets within one step of its
-        # ceiling.  Without the first the rule would push buying from a cheap
-        # night into the dear morning.
+        # The rule as two price thresholds per hour; every hour below either
+        # one runs at its cap.  A cheaper hour cannot stand in for a dearer
+        # one across a battery limit, so:
+        #   earlier — set by any charge, a reserve-forced one too (a cheaper
+        #     hour before it could have bought that energy); carried back in
+        #     time until the SOC is within one step of its ceiling;
+        #   later — set by a charge made by choice; carried forward until the
+        #     SOC gets within one step of its floor (reserve or SOC target:
+        #     energy bought before is needed there).  Without that the rule
+        #     would push buying from a cheap night into the dear morning.
         step_soc = step_kw / capacity_kwh
         soc_floor = np.full(n, soc_lo)
         for t, tgt in targets.items():
             soc_floor[t - 1] = max(soc_floor[t - 1], tgt)
         voluntary = cp.Variable(n, boolean=True)  # offgrid would keep the reserve
-        limit = cp.Variable(n)                    # price threshold
-        below = cp.Variable(n, boolean=True)      # the hour is cheaper than the threshold
+        earlier = cp.Variable(n)                  # threshold from charges at or after the hour
+        later = cp.Variable(n)                    # threshold from chosen charges at or before it
+        below = cp.Variable(n, boolean=True)      # the hour is cheaper than a threshold
         low = cp.Variable(n, boolean=True)        # SOC after the hour is near its floor
         high = cp.Variable(n, boolean=True)       # SOC after the hour is near its ceiling
         # No room for a whole step before the hour or after it: nothing to fill.
         full = high + cp.hstack([float(initial_soc >= soc_hi[0] - step_soc), high[:-1]])
         constraints += [
             voluntary >= soc[:-1] - dt * deficit / eta_dis / capacity_kwh - soc_lo,
-            soc[1:] <= soc_floor + step_soc + (1 - low),
-            soc[1:] >= soc_hi - step_soc - (1 - high),
-            limit >= price.min(),
-            limit <= price.max(),
-            limit >= price - span * (1 - voluntary + sbu),
-            limit <= price + span * below,
-            limit[1:] >= limit[:-1] - span * low[:-1],
-            limit[1:] <= limit[:-1] + span * high[:-1],
+            # Switched off, each bound relaxes exactly to the SOC range [0, ceiling].
+            soc[1:] <= soc_floor + step_soc + cp.multiply(soc_hi - soc_floor - step_soc, 1 - low),
+            soc[1:] >= cp.multiply(soc_hi - step_soc, high),
+            earlier >= price - span * sbu,
+            earlier[:-1] >= earlier[1:] - span * high[:-1],
+            later >= price - span * (1 - voluntary + sbu),
+            later[1:] >= later[:-1] - span * low[:-1],
+            earlier <= price + span * below,
+            later <= price + span * below,
+            earlier <= price.max(),
+            later <= price.max(),
+            earlier >= price.min() - span,
+            later >= price.min() - span,
             k + missed >= cp.multiply(k_cap, below - full),
         ]
 
     for i, (t, tgt) in enumerate(targets.items()):
-        constraints.append(soc[t] + short[i] >= tgt)
+        constraints.append(soc[t] + short[i] / capacity_kwh >= tgt)
         print(f"  → SOC ≥ {tgt * 100:.0f}% after {t} h", file=sys.stderr)
 
     # Earlier PV intake scores higher, so the battery takes PV as soon as it
@@ -245,7 +256,7 @@ def _build_and_solve(
     pv_weight = _EPS * np.arange(n, 0, -1) / n
     objective = cp.Minimize(
         (price * dt) @ (grid_load + grid_charge) - _EPS * cp.sum(sbu) - pv_weight @ pv_in
-        + _PENALTY * (cp.sum(over) + (cp.sum(short) + cp.sum(under)) * capacity_kwh)
+        + _PENALTY * (cp.sum(over) + cp.sum(short) + cp.sum(under))
         + _RULE_PENALTY * cp.sum(missed)
     )
 
@@ -312,7 +323,7 @@ def _build_and_solve(
         )
 
     over_kwh = np.maximum(over.value, 0.0) * dt
-    reached = {t: float(short.value[i]) < 1e-3 for i, t in enumerate(targets)}
+    reached = {t: float(short.value[i]) < 1e-3 * capacity_kwh for i, t in enumerate(targets)}
 
     # One block per calendar day (block 0 = the day of index 0).
     blocks = []
@@ -338,7 +349,7 @@ def _build_and_solve(
     bent = [start_hour + t for t in range(n) if missed.value is not None and missed.value[t] > 0.5]
     if bent:
         warnings.append(f"Cheapest-hour-first rule bent in horizon hours {bent} to keep a SOC target or the reserve")
-    low_hours = [start_hour + t for t in range(n) if under.value[t] > 1e-3]
+    low_hours = [start_hour + t for t in range(n) if under.value[t] > 1e-3 * capacity_kwh]
     if low_hours:
         warnings.append(f"SOC below the {soc_lo * 100:.0f}% reserve in horizon hours {low_hours}")
     for t, ok in reached.items():
