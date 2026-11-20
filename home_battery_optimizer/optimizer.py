@@ -189,6 +189,18 @@ def _build_and_solve(
         # still trip the breaker; lower GRID_LIMIT_KW if that happens.
         grid_load + grid_charge <= grid_cap + over,
     ]
+    # The inverter takes all PV surplus until the pack is full; it cannot hold
+    # PV back to keep room.  Left free, a tie within the MIP gap curtailed PV
+    # at 16 % SOC (2026-11-20).
+    # shortcut: hours where the 150 A total could cap PV next to grid charging stay free; model that cap too if a plan curtails PV there.
+    must_take = np.flatnonzero((surplus > 0) & (eta_ch * surplus + k_max * step_kw <= max_batt_in_kw))
+    if must_take.size:
+        pv_full = cp.Variable(must_take.size, boolean=True)  # the pack reaches its ceiling that hour
+        constraints += [
+            pv_in[must_take] >= cp.multiply(surplus[must_take], 1 - pv_full),
+            soc[must_take + 1] >= cp.multiply(soc_hi[must_take] - 1e-6, pv_full),
+        ]
+
     # Fill the cheaper hour to its full current before a dearer one: a dearer
     # hour charges by choice only when every cheaper hour runs at its cap
     # (80 A, less where the breaker leaves less) — a cheaper hour left offgrid
@@ -215,6 +227,10 @@ def _build_and_solve(
         #     SOC gets within one step of its floor (reserve or SOC target:
         #     energy bought before is needed there).  Without that the rule
         #     would push buying from a cheap night into the dear morning.
+        # The ceiling only excuses an hour below 'earlier'.  Moving a charge
+        # to a later cheaper hour leaves the SOC after that hour where it was,
+        # so its room there is no excuse: the dearer charge itself took it
+        # (2026-11-20: 10:00 at 1.29 took 23:00's room).
         step_soc = step_kw / capacity_kwh
         soc_floor = np.full(n, soc_lo)
         for t, tgt in targets.items():
@@ -222,27 +238,34 @@ def _build_and_solve(
         voluntary = cp.Variable(n, boolean=True)  # offgrid would keep the reserve
         earlier = cp.Variable(n)                  # threshold from charges at or after the hour
         later = cp.Variable(n)                    # threshold from chosen charges at or before it
-        below = cp.Variable(n, boolean=True)      # the hour is cheaper than a threshold
+        below_e = cp.Variable(n, boolean=True)    # the hour is cheaper than 'earlier'
+        below_l = cp.Variable(n, boolean=True)    # the hour is cheaper than 'later'
         low = cp.Variable(n, boolean=True)        # SOC after the hour is near its floor
-        high = cp.Variable(n, boolean=True)       # SOC after the hour is near its ceiling
+        high = cp.Variable(n, boolean=True)       # SOC after the hour has no room for a whole step
+        # Exactly one step of room is still room: a SOC target at the ceiling
+        # ends there, and treating it as full let the last cheap hour stay at
+        # 10 A while 10:00 (1.29) charged (2026-11-20). The margin sits above
+        # the solver's tolerances.
+        top = soc_hi - step_soc + 1e-5
         # No room for a whole step before the hour or after it: nothing to fill.
-        full = high + cp.hstack([float(initial_soc >= soc_hi[0] - step_soc), high[:-1]])
+        full = high + cp.hstack([float(initial_soc >= top[0]), high[:-1]])
         constraints += [
             voluntary >= soc[:-1] - dt * deficit / eta_dis / capacity_kwh - soc_lo,
             # Switched off, each bound relaxes exactly to the SOC range [0, ceiling].
             soc[1:] <= soc_floor + step_soc + cp.multiply(soc_hi - soc_floor - step_soc, 1 - low),
-            soc[1:] >= cp.multiply(soc_hi - step_soc, high),
+            soc[1:] >= cp.multiply(top, high),
             earlier >= price - span * sbu,
             earlier[:-1] >= earlier[1:] - span * high[:-1],
             later >= price - span * (1 - voluntary + sbu),
             later[1:] >= later[:-1] - span * low[:-1],
-            earlier <= price + span * below,
-            later <= price + span * below,
+            earlier <= price + span * below_e,
+            later <= price + span * below_l,
             earlier <= price.max(),
             later <= price.max(),
             earlier >= price.min() - span,
             later >= price.min() - span,
-            k + missed >= cp.multiply(k_cap, below - full),
+            k + missed >= cp.multiply(k_cap, below_e - full),
+            k + missed >= cp.multiply(k_cap, below_l),
         ]
 
     for i, (t, tgt) in enumerate(targets.items()):
@@ -250,9 +273,7 @@ def _build_and_solve(
         print(f"  → SOC ≥ {tgt * 100:.0f}% after {t} h", file=sys.stderr)
 
     # Earlier PV intake scores higher, so the battery takes PV as soon as it
-    # comes. ponytail: the solver may still skip morning PV to leave room for
-    # paid grid charging in later negative hours, which the inverter can't do;
-    # needs a "battery full" binary per hour if that ever shows up in a plan.
+    # comes (only matters where PV intake is left free, see must_take).
     pv_weight = _EPS * np.arange(n, 0, -1) / n
     objective = cp.Minimize(
         (price * dt) @ (grid_load + grid_charge) - _EPS * cp.sum(sbu) - pv_weight @ pv_in

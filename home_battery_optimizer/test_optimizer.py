@@ -44,10 +44,11 @@ def _prices(values):
     return [{"hour": h, "price": p} for h, p in enumerate(values)]
 
 
-def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
+def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None, frac=1.0):
     """Recompute SOC from the chosen modes only and compare with the plan.
 
-    ``floors`` is {hour index: SOC fraction} for SOC targets inside the plan.
+    ``floors`` is {hour index: SOC fraction} for SOC targets inside the plan;
+    ``frac`` is the part of the first hour still ahead.
     """
     soc = soc0 * CAP_KWH
     hi = max(MAX_SOC, soc0) * CAP_KWH
@@ -55,16 +56,17 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
     for i, d in enumerate(result["decisions"]):
         h = len(deficit) - len(result["decisions"]) + i
         before = soc
-        by_choice = d["ac_on"] and soc - deficit[h] / DISCHARGE_EFFICIENCY - 0.10 * CAP_KWH > 1e-3
+        dt = frac if i == 0 else 1.0
+        by_choice = d["ac_on"] and soc - dt * deficit[h] / DISCHARGE_EFFICIENCY - 0.10 * CAP_KWH > 1e-3
         # Only two modes: offgrid, or AC on and charging — never a plain bypass.
         assert (d["output_mode"], d["charger_mode"]) in (("SBU", "OSO"), ("SUB", "SNU")), d
         assert d["ac_on"] == (d["output_mode"] == "SUB") and (not d["ac_on"] or d["charge_amps"] >= 10), d
         if d["output_mode"] == "SBU":
-            soc -= deficit[h] / DISCHARGE_EFFICIENCY
+            soc -= dt * deficit[h] / DISCHARGE_EFFICIENCY
         grid_in = d["charge_amps"] * NOMINAL_VOLTAGE / 1000
-        soc += grid_in
+        soc += dt * grid_in
         pv_room = MAX_TOTAL_CHARGE_CURRENT_A * NOMINAL_VOLTAGE / 1000 - grid_in
-        soc += min(CHARGE_EFFICIENCY * surplus[h], pv_room, max(0.0, hi - soc))
+        soc += min(dt * CHARGE_EFFICIENCY * surplus[h], dt * pv_room, max(0.0, hi - soc))
         assert abs(soc / CAP_KWH * 100 - d["soc_pct"]) < 0.2, (h, soc / CAP_KWH, d)
         # Grid import next to the dummy circuit must stay under the breaker.
         cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if d["price_plkwh"] < 0 else 0.0)
@@ -76,13 +78,13 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
     # whatever the reason (also a reserve-forced charge: the earlier hour
     # could have bought that energy), a later one when the dearer hour
     # charges by choice, i.e. offgrid there would have kept the 10 % reserve.
-    # Exempt: a cheaper hour with no room for a whole 10 A step before or
-    # after it; a later cheaper hour when the battery comes within one step
-    # of its floor first; an earlier one when it comes within one step of its
-    # ceiling in between.
+    # Exempt: a later cheaper hour when the battery comes within one step of
+    # its floor first; an earlier one when it has no room for a whole 10 A
+    # step before or after it, or the battery comes that close to its
+    # ceiling in between.  Exactly one step of room is still room.
     step = NOMINAL_VOLTAGE / 1000 * 10
     tol = 1e-3
-    near_top = hi - step - tol
+    near_top = hi - step + tol
     for h_dear, p_dear, amps_dear, _, _, by_choice in rows:
         for h, p, amps, before, after, _ in rows:
             binds = amps_dear > 0 if h < h_dear else by_choice
@@ -94,8 +96,7 @@ def _replay(result, deficit, surplus, soc0, cheapest_first=True, floors=None):
                     r[4] <= max(0.10, (floors or {}).get(r[0], 0.0)) * CAP_KWH + step + tol for r in between
                 )
             else:
-                exempt = any(r[4] >= near_top for r in between)
-            exempt = exempt or before >= near_top or after >= near_top
+                exempt = any(r[4] >= near_top for r in between) or before >= near_top or after >= near_top
             cap = GRID_LIMIT_KW - (DUMMY_LOAD_KW if p < 0 else 0.0) - deficit[h]
             full = min(MAX_CHARGE_CURRENT_A, int(cap / (step / CHARGE_EFFICIENCY) + 1e-9) * 10)
             assert exempt or amps >= full, (h, p, amps, full, "dearer hour charges", h_dear, p_dear)
@@ -249,6 +250,28 @@ def check_forced_hour_is_no_excuse():
         assert all(b["summary"]["target_reached"] is not False for b in r["blocks"]), targets
 
 
+def check_dear_charge_takes_no_room():
+    # 2026-11-20 10:04, battery at 32 %, 99 % wanted today (91.9 % = MaxSOC
+    # less one step), tomorrow estimated.  The plan bought 10 A at 10:00
+    # (1.29) and only 10 A at 23:00 (0.871): 23:00 then ended within one step
+    # of MaxSOC and counted as full, though that room was taken by the 10:00
+    # charge itself.  Inputs rebuilt from that plan.
+    A, B = 1.292853, 0.87084
+    prices = _prices([A] * 13 + [B, B] + [A] * 7 + [B, B] + [B] * 6 + [A] * 7 + [B, B] + [A] * 7 + [B, B])
+    deficit = [0.0] * 10 + [0.218, 0.231, 0.124, 0.308, 0.327, 0.293, 0.299, 0.3, 0.382, 0.545, 0.766, 0.398,
+                            0.366, 0.372] \
+        + [0.349, 0.293, 0.282, 0.289, 0.271, 0.465, 1.049, 0.878, 0.278, 0, 0.035, 0.341, 0, 0.197, 0.162,
+           0.323, 0.312, 0.272, 0.379, 0.426, 0.315, 0.419, 0.499, 0.462]
+    surplus = [0.0] * 33 + [0.063, 0, 0, 0.486] + [0.0] * 11
+    for frac in (1.0, 56 / 60):
+        r = optimize(prices, deficit, 0.32, start_hour=10, pv_surplus_kw=surplus, day_targets={0: 0.99},
+                     first_hour_fraction=frac)
+        _replay(r, deficit, surplus, 0.32, floors={23: 0.99}, frac=frac)
+        today = r["blocks"][0]
+        dear_kwh = sum(d["grid_kwh"] for d in today["decisions"] if d["price_plkwh"] > 1.0)
+        assert dear_kwh == 0 and today["summary"]["target_reached"] and not r["warnings"], (frac, today, r["warnings"])
+
+
 def check_first_hour_fraction():
     # A plan made at 22:30 has half of that hour left: 80 A moves 12.5 % of
     # SOC there, not 25 %, and costs half; the next hour is a whole one.
@@ -280,6 +303,7 @@ if __name__ == "__main__":
     check_cheapest_hour_full_first()
     check_cheaper_hour_left_off()
     check_forced_hour_is_no_excuse()
+    check_dear_charge_takes_no_room()
     check_first_hour_fraction()
     check_min_cost_per_kwh_still_works()
     print("optimizer self-check OK")

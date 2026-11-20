@@ -205,12 +205,15 @@ GBB Optimizer manual for a non-prosument LiFePo4 + Pstryk setup):
 > **Cheapest hour first:** a dearer hour charges by choice only when every
 > cheaper hour runs at its full current (80 A, or what the 25 A breaker leaves
 > next to the house) — a cheaper hour left offgrid counts too — so the rest of
-> a 10 A step lands on the dearest charging hour. Exempt: a cheaper hour with
-> no room for a whole 10 A step; a later cheaper hour when the battery first
-> comes within one step of the reserve or a SOC target (the energy is needed
-> before that hour comes), or when the dearer hour is forced by the reserve
-> (offgrid would drop the SOC below `min_soc_pct`); an earlier cheaper hour
-> when the battery comes within one step of `max_soc_pct` in between. A
+> a 10 A step lands on the dearest charging hour. Exempt: a later cheaper
+> hour when the battery first comes within one step of the reserve or a SOC
+> target (the energy is needed before that hour comes), or when the dearer
+> hour is forced by the reserve (offgrid would drop the SOC below
+> `min_soc_pct`); an earlier cheaper hour with less than a whole 10 A step of
+> room before or after it, or when the battery comes within one step of
+> `max_soc_pct` in between. `max_soc_pct` is no excuse for a later cheaper
+> hour: moving the dearer charge there leaves the SOC after it unchanged, so
+> any room it lacks was taken by that charge. A
 > reserve-forced hour is no excuse towards an earlier cheaper hour: that
 > hour could have bought the energy, so it is filled first. The rule only
 > gives way to a SOC target or the reserve (flagged in `warnings`); if the
